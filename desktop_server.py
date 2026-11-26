@@ -41,6 +41,7 @@ from continuity_store import (  # noqa: E402
     compute_file_hashes,
     extract_diff_paths,
 )
+from device_mesh import DeviceRegistry, discover_tailscale_peers  # noqa: E402
 from fleet_scanner import scan_fleet  # noqa: E402
 from orchestrator import LANES, review_agent_diff, run_tournament  # noqa: E402
 from research_loop import ResearchConfig, run_research_swarm  # noqa: E402
@@ -139,6 +140,8 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         "agent_tools.py",
         "agent_loop.py",
         "research_loop.py",
+        "device_mesh.py",
+        "swarm_node.py",
     ):
         src = HERE / fname
         if src.is_file():
@@ -154,6 +157,8 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         "tests/test_agent_tools.py",
         "tests/test_agent_loop.py",
         "tests/test_research_loop.py",
+        "tests/test_device_mesh.py",
+        "tests/test_swarm_node.py",
     ):
         src = HERE / rel
         if src.is_file():
@@ -360,6 +365,7 @@ class DesktopAppState:
         self.self_build_dir = self.runs_dir.parent / "self_build_repo"
         self.telemetry_path = self.runs_dir.parent / "chat_telemetry.jsonl"
         self.continuity = ContinuityStore(self.runs_dir.parent / "continuity.sqlite3")
+        self.devices = DeviceRegistry(self.runs_dir.parent / "devices.json")
         self.preview = PreviewServerManager(port=preview_port, default_repo=self.self_build_dir)
         self.runner_fn = runner_fn or run_swarm
         self._lock = threading.Lock()
@@ -599,6 +605,8 @@ class DesktopAppState:
                         "agent_id": aid,
                         "ticket": str(ev.get("ticket") or prev.get("ticket") or ""),
                         "title": str(ev.get("title") or prev.get("title") or aid),
+                        "device_id": str(ev.get("device_id") or prev.get("device_id") or ""),
+                        "device_name": str(ev.get("device_name") or prev.get("device_name") or ""),
                         "stage": new_stage,
                         "reasoning_chars": int(ev.get("reasoning_chars") or 0),
                         "content_chars": int(ev.get("content_chars") or 0),
@@ -753,6 +761,7 @@ class DesktopAppState:
                             "use_tool_loop": bool(use_tool_loop),
                             "continuity_store": self.continuity,
                             "runs_dir": self.runs_dir,
+                            "device_registry": self.devices,
                         }
                         for k, v in extras.items():
                             if has_varkw or k in sig.parameters:
@@ -781,6 +790,8 @@ class DesktopAppState:
                         "agent_id": aid,
                         "ticket": str(r.get("ticket") or prev_l.get("ticket") or ""),
                         "title": str(r.get("title") or prev_l.get("title") or aid),
+                        "device_id": str(r.get("device_id") or prev_l.get("device_id") or ""),
+                        "device_name": str(r.get("device_name") or prev_l.get("device_name") or ""),
                         "stage": str(r.get("stage") or ("passed" if r.get("tests_ok") else "failed")),
                         "reasoning_chars": len(r.get("reasoning_preview") or "") or prev_l.get("reasoning_chars", 0),
                         "content_chars": len(r.get("output_preview") or "") or prev_l.get("content_chars", 0),
@@ -1084,6 +1095,19 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                 except Exception as exc:
                     self._send_json(500, {"error": str(exc)})
                 return
+            if path == "/api/devices":
+                try:
+                    self._send_json(
+                        200,
+                        {
+                            "devices": state.devices.list_devices(probe=True),
+                            "tailscale": discover_tailscale_peers(),
+                            "pair_cmd": "python3 swarm_node.py --pair",
+                        },
+                    )
+                except Exception as exc:
+                    self._send_json(500, {"error": str(exc)})
+                return
             if path == "/api/continuity/status":
                 qs = parse_qs(urlsplit(self.path).query)
                 repo_key = str((qs.get("repo") or [_default_repo_path()])[0])
@@ -1161,6 +1185,34 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                 url = str(body.get("backend_url") or PRESETS[0]["backend_url"]).strip()
                 key = str(body.get("api_key") or "").strip()
                 self._send_json(200, probe_backend(url, key))
+                return
+
+            if path == "/api/devices/pair":
+                try:
+                    paired = state.devices.pair_device(
+                        host=str(body.get("host") or "").strip(),
+                        pair_code=str(body.get("pair_code") or "").strip(),
+                        name=str(body.get("name") or "").strip(),
+                        port=int(body.get("port") or 18799),
+                        client_label=str(body.get("client_label") or "Open Swarm"),
+                    )
+                    self._send_json(200, paired)
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                except Exception as exc:
+                    self._send_json(502, {"error": str(exc)})
+                return
+
+            if path == "/api/devices/remove":
+                did = str(body.get("device_id") or "").strip()
+                if not did:
+                    self._send_json(400, {"error": "device_id is required"})
+                    return
+                removed = state.devices.remove_device(did)
+                if not removed:
+                    self._send_json(404, {"error": f"Cannot remove device {did!r}"})
+                    return
+                self._send_json(200, {"ok": True, "removed": did})
                 return
 
             if path == "/api/self-build-repo":

@@ -686,6 +686,135 @@ class DesktopServerTests(unittest.TestCase):
             mock_srv.shutdown()
             mock_srv.server_close()
 
+    def test_devices_api_pair_list_and_remote_execution(self) -> None:
+        from swarm_node import NodeStateStore, SwarmNodeServer
+        from swarm_run import run_swarm
+
+        class _RemoteExecOpenAIHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                _ = self.rfile.read(n)
+                raw = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": (
+                                        "```file:cuda_op.py\n"
+                                        "def fast_op(x):\n"
+                                        "    return x * 2\n"
+                                        "```\n"
+                                        "```file:tests/test_cuda_op.py\n"
+                                        "import unittest\n"
+                                        "from cuda_op import fast_op\n"
+                                        "class CudaOpTest(unittest.TestCase):\n"
+                                        "    def test_fast_op(self):\n"
+                                        "        self.assertEqual(fast_op(21), 42)\n"
+                                        "if __name__ == '__main__':\n"
+                                        "    unittest.main()\n"
+                                        "```\n"
+                                    ),
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 30, "cached_tokens": 15, "completion_tokens": 40},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        node_state_file = self.tmp_dir / "remote_node_state.json"
+        store = NodeStateStore(node_state_file)
+        pin = store.generate_pair_code()
+        node_srv = SwarmNodeServer(
+            host="127.0.0.1",
+            port=0,
+            state_path=node_state_file,
+            node_name="Mock DGX Spark",
+        )
+        node_port = node_srv.start()
+
+        mock_oai = ThreadingHTTPServer(("127.0.0.1", 0), _RemoteExecOpenAIHandler)
+        m_port = mock_oai.server_address[1]
+        threading.Thread(target=mock_oai.serve_forever, daemon=True).start()
+        orig_runner = self.state.runner_fn
+        self.state.runner_fn = run_swarm
+
+        try:
+            st_pair, paired = _http_json(
+                f"{self.base}/api/devices/pair",
+                method="POST",
+                payload={
+                    "host": "127.0.0.1",
+                    "port": node_port,
+                    "pair_code": pin,
+                    "name": "DGX Spark Test",
+                },
+            )
+            self.assertEqual(st_pair, 200)
+            self.assertEqual(paired["name"], "DGX Spark Test")
+            self.assertNotIn("token", paired)
+
+            st_list, devs = _http_json(f"{self.base}/api/devices")
+            self.assertEqual(st_list, 200)
+            self.assertGreaterEqual(len(devs["devices"]), 2)
+            remote_entry = next(d for d in devs["devices"] if not d.get("is_local"))
+            self.assertTrue(remote_entry["online"])
+            self.assertNotIn("token", remote_entry)
+
+            # Force remote execution directly via target_device pointing to paired node
+            st_run, rec = _http_json(
+                f"{self.base}/api/runs",
+                method="POST",
+                payload={
+                    "repo": str(self.repo_dir),
+                    "backend_url": f"http://127.0.0.1:{m_port}/v1",
+                    "model": "test-model",
+                    "tasks": [
+                        {
+                            "id": "MESH-1",
+                            "title": "Add cuda_op helper",
+                            "spec": "Implement fast_op in cuda_op.py",
+                            "acceptance_cmd": "python3 -m unittest tests/test_cuda_op.py",
+                            "target_device": remote_entry["device_id"],
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(st_run, 202)
+            rid = rec["run_id"]
+            final = rec
+            for _ in range(80):
+                _, final = _http_json(f"{self.base}/api/runs/{rid}")
+                if final["status"] in ("completed", "error"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(final["status"], "completed", final.get("error"))
+            self.assertEqual(final["passed_count"], 1)
+            r0 = final["results"][0]
+            self.assertEqual(r0["device_id"], remote_entry["device_id"])
+            self.assertEqual(r0["device_name"], "DGX Spark Test")
+
+            st_ap, ap = _http_json(
+                f"{self.base}/api/runs/{rid}/apply",
+                method="POST",
+                payload={"agent_id": r0["agent_id"]},
+            )
+            self.assertEqual(st_ap, 200)
+            self.assertIn("fast_op", (self.repo_dir / "cuda_op.py").read_text(encoding="utf-8"))
+        finally:
+            self.state.runner_fn = orig_runner
+            node_srv.stop()
+            mock_oai.shutdown()
+            mock_oai.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

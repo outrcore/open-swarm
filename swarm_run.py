@@ -300,6 +300,8 @@ def run_swarm(
     use_tool_loop: bool = False,
     max_tool_turns: int = 8,
     readonly_paths: list[str] | None = None,
+    device_registry: Any = None,
+    route_to_mesh: bool = True,
 ) -> dict[str, Any]:
     """Execute `tasks` in parallel isolated git worktrees and return metered diffs + test verdicts."""
     from agent_tools import build_agent_context_brief, detect_file_collisions
@@ -313,6 +315,16 @@ def run_swarm(
         else ""
     )
     shared_sys = build_shared_repo_prefix(repo, context_brief=context_brief)
+
+    routing_assignments: list[dict[str, Any]] = []
+    if route_to_mesh and device_registry is not None:
+        try:
+            from device_mesh import route_tasks_to_devices
+
+            mesh_devices = device_registry.list_devices(probe=True)
+            routing_assignments = route_tasks_to_devices(tasks, mesh_devices, mode="swarm")
+        except Exception:
+            routing_assignments = []
 
     def _emit_progress(payload: dict[str, Any]) -> None:
         if on_progress is None:
@@ -358,6 +370,10 @@ def run_swarm(
         item_lane = str(item.get("lane") or "coder")
         item_max_tokens = int(item.get("max_tokens") or max_tokens)
         item_temp = float(item.get("temperature") if item.get("temperature") is not None else 0.0)
+        assign = routing_assignments[idx] if idx < len(routing_assignments) else {}
+        assigned_device_id = str(assign.get("device_id") or "local")
+        assigned_device_name = str(assign.get("device_name") or ("This Mac" if sys.platform == "darwin" else "Local"))
+        assigned_is_local = bool(assign.get("is_local", True))
         branch = f"swarm/{run_id}/{agent_id}"
         wt = wt_base / agent_id
         t_ag0 = time.monotonic()
@@ -368,6 +384,8 @@ def run_swarm(
             "title": title,
             "model": item_model,
             "lane": item_lane,
+            "device_id": assigned_device_id,
+            "device_name": assigned_device_name,
             "branch": branch,
             "worktree": str(wt),
             "stage": "worktree",
@@ -408,6 +426,8 @@ def run_swarm(
                     "agent_id": agent_id,
                     "ticket": ticket_id,
                     "title": title,
+                    "device_id": assigned_device_id,
+                    "device_name": assigned_device_name,
                     "stage": stage,
                     "reasoning_chars": prog_state["reasoning_chars"],
                     "content_chars": prog_state["content_chars"],
@@ -426,6 +446,61 @@ def run_swarm(
             _emit_agent(next_stage)
 
         _emit_agent("worktree", force=True)
+        if not assigned_is_local and device_registry is not None:
+            try:
+                from device_mesh import execute_task_on_remote_device
+
+                creds = device_registry.get_device_credentials(assigned_device_id)
+                if creds is not None:
+                    _emit_agent("coding", force=True)
+                    remote_item = dict(item)
+                    remote_item.setdefault("agent_id", agent_id)
+                    remote_item.setdefault("id", ticket_id)
+                    remote_res = execute_task_on_remote_device(
+                        repo=repo,
+                        device_creds=creds,
+                        task=remote_item,
+                        base_url=item_base_url,
+                        model=item_model,
+                        api_key=api_key,
+                        spend_cap_usd=float(spend_cap_usd or 0.5),
+                        max_repair_turns=int(max_repair_turns),
+                        auto_review=bool(auto_review),
+                    )
+                    remote_res["agent_id"] = agent_id
+                    remote_res["ticket"] = ticket_id
+                    remote_res["title"] = title
+                    remote_res["worktree"] = str(wt)
+                    remote_res["branch"] = branch
+                    remote_res["device_id"] = assigned_device_id
+                    remote_res["device_name"] = assigned_device_name
+                    remote_res["executed_on"] = assigned_device_name
+                    p_t = int(remote_res.get("prompt_tokens") or 0)
+                    c_t = int(remote_res.get("cached_tokens") or 0)
+                    o_t = int(remote_res.get("completion_tokens") or 0)
+                    if p_t or o_t:
+                        try:
+                            meter.record_usage(
+                                agent_id,
+                                prompt_tokens=p_t,
+                                cached_tokens=c_t,
+                                completion_tokens=o_t,
+                                gen_s=max(0.1, time.monotonic() - t_ag0),
+                                ttft_ms=remote_res.get("ttft_ms"),
+                            )
+                        except Exception:
+                            pass
+                    meter.set_agent_wall(agent_id, time.monotonic() - t_ag0)
+                    final_st = "passed" if remote_res.get("tests_ok") else "failed"
+                    remote_res["stage"] = final_st
+                    _emit_agent(final_st, force=True)
+                    return remote_res
+            except Exception as remote_exc:
+                # Fall back seamlessly to local worktree if remote node dropped mid-dispatch
+                assigned_device_id = "local"
+                assigned_device_name = f"Local (fallback: {type(remote_exc).__name__})"
+                res_info["device_id"] = assigned_device_id
+                res_info["device_name"] = assigned_device_name
         try:
             meter.check_cap()
             item_readonly = list(item.get("readonly_paths") or readonly_paths or [])

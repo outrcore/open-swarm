@@ -128,6 +128,18 @@ Point any OpenAI-compatible coding agent at `https://api.outrcore.com/v1` to lev
 
 ---
 
+## Verified Devices & Compute Mesh (Tailscale)
+
+Pair secondary workstations (such as a Linux GPU server or DGX Spark) over Tailscale with zero open public ports:
+
+```bash
+python3 swarm_node.py --pair
+```
+
+Open Swarm detects online Tailscale peers, verifies each machine with a single-use 6-digit code and SHA-256 fingerprint pinning, and automatically routes macOS/Swift work locally while dispatching GPU/CUDA tasks and overflow worktrees onto paired Linux GPU nodes.
+
+---
+
 ## Running Tests
 
 Run the offline unit test suite (no external network calls required):

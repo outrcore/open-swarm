@@ -32,6 +32,8 @@ cp "$SWARM_DIR/orchestrator.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/agent_tools.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/agent_loop.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/research_loop.py" "$BUNDLE_SWARM/"
+cp "$SWARM_DIR/device_mesh.py" "$BUNDLE_SWARM/"
+cp "$SWARM_DIR/swarm_node.py" "$BUNDLE_SWARM/"
 chmod +x "$BUNDLE_SWARM/desktop_server.py"
 
 cat > "$CONTENTS/Info.plist" << 'PLIST'
@@ -54,9 +56,9 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.2.0</string>
+  <string>0.3.0</string>
   <key>CFBundleVersion</key>
-  <string>2</string>
+  <string>3</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

@@ -281,6 +281,10 @@
       <span class="trunc" id="repoNamePill">Select repository…</span>
       <span style="color:var(--muted);">▾</span>
     </button>
+    <button class="pill-btn" onclick="refreshDevices();togglePop('devicesPop', event)">
+      <span class="dot ok" id="devDot"></span>
+      <span class="trunc" id="devCountPill">1 Device</span>
+    </button>
     <div class="spacer"></div>
     <button class="pill-btn" onclick="togglePop('settingsPop', event)">
       <span class="dot" id="gpuDot"></span>
@@ -393,6 +397,29 @@
       <button onclick="pickFolder();closePops();">Choose Folder…</button>
       <button onclick="loadSelfBuildSwarm();closePops();">Use Isolated Self-Build Copy</button>
       <button onclick="useSandboxRepo();closePops();">Create 2-Agent Sample Repo</button>
+    </div>
+  </div>
+
+  <!-- Devices Popover -->
+  <div id="devicesPop" class="popover left" style="left:165px;width:330px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+      <b style="font-size:12.5px;">Verified Compute Mesh</b>
+      <button class="ghost" style="padding:2px 8px;font-size:11px;" onclick="refreshDevices()">Refresh</button>
+    </div>
+    <div id="devicesList" style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px;font-size:12px;"></div>
+    <div id="tailscalePeersBox" style="margin-bottom:10px;"></div>
+    <div style="border-top:1px solid var(--border);padding-top:9px;">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:5px;">+ Pair Remote Device (Tailscale)</div>
+      <div style="display:grid;grid-template-columns:1fr 72px;gap:6px;margin-bottom:6px;">
+        <input id="pairHost" placeholder="100.x.y.z or hostname" style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;" />
+        <input id="pairPort" type="number" value="18799" style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;" />
+      </div>
+      <div style="display:grid;grid-template-columns:92px 1fr auto;gap:6px;margin-bottom:6px;">
+        <input id="pairCode" placeholder="6-digit PIN" maxlength="6" style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;font-family:var(--mono);" />
+        <input id="pairName" placeholder="Name (e.g. DGX Spark)" style="background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 8px;font-size:12px;" />
+        <button class="primary" onclick="pairDevice()">Pair</button>
+      </div>
+      <div style="font-size:11px;color:var(--muted);font-family:var(--mono);">On remote box: python3 swarm_node.py --pair</div>
     </div>
   </div>
 
@@ -523,7 +550,89 @@ function toggleTheme(dark) {
 
 function closePops() {
   document.getElementById("repoPop").classList.remove("show");
+  document.getElementById("devicesPop").classList.remove("show");
   document.getElementById("settingsPop").classList.remove("show");
+}
+
+async function refreshDevices() {
+  try {
+    const data = await api("/api/devices");
+    const devs = data.devices || [];
+    const onlineCnt = devs.filter(d => d.online && !d.tampered).length;
+    document.getElementById("devDot").className = onlineCnt > 0 ? "dot ok" : "dot err";
+    document.getElementById("devCountPill").textContent = `${onlineCnt} Device${onlineCnt === 1 ? "" : "s"}`;
+
+    const listEl = document.getElementById("devicesList");
+    listEl.innerHTML = devs.map(d => {
+      const gpuTxt = d.gpu && d.gpu.name ? d.gpu.name : (d.capabilities && d.capabilities.includes("swift") ? "Apple Silicon" : (d.os || ""));
+      const stCls = d.tampered ? "fail" : (d.online ? "ok" : "warn");
+      const stTxt = d.tampered ? "Tampered" : (d.online ? "Online" : "Offline");
+      return `
+        <div style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--surface-2);border-radius:10px;border:1px solid var(--border);">
+          <span class="dot ${d.online && !d.tampered ? 'ok' : 'err'}"></span>
+          <div style="min-width:0;flex:1;">
+            <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(d.name || d.device_id)}</div>
+            <div style="font-size:11px;color:var(--muted);">${escapeHtml(gpuTxt)}${d.inference_url ? " · Local LLM" : ""}</div>
+          </div>
+          <span class="badge ${stCls}">${stTxt}</span>
+          ${!d.is_local ? `<button class="ghost danger-txt" style="padding:1px 6px;" onclick="removeDevice('${escapeHtml(d.device_id)}')">×</button>` : ""}
+        </div>`;
+    }).join("");
+
+    const ts = data.tailscale || {};
+    const tsBox = document.getElementById("tailscalePeersBox");
+    const peers = (ts.peers || []).filter(p => !p.is_self && p.ip);
+    if (peers.length) {
+      tsBox.innerHTML = `<div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;">Tailscale Peers</div>` +
+        peers.slice(0, 4).map(p => `
+          <div style="display:flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 0;">
+            <span class="dot ${p.online ? 'ok' : ''}"></span>
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(p.hostname || p.ip)} (${escapeHtml(p.ip)})</span>
+            <button style="padding:2px 8px;font-size:11px;" onclick="fillTailscalePeer('${escapeHtml(p.ip)}','${escapeHtml(p.hostname || '')}')">Fill</button>
+          </div>`).join("");
+    } else {
+      tsBox.innerHTML = "";
+    }
+  } catch (_) {}
+}
+
+function fillTailscalePeer(ip, name) {
+  document.getElementById("pairHost").value = ip;
+  if (name && !document.getElementById("pairName").value) document.getElementById("pairName").value = name;
+  document.getElementById("pairCode").focus();
+}
+
+async function pairDevice() {
+  const host = document.getElementById("pairHost").value.trim();
+  const port = parseInt(document.getElementById("pairPort").value || "18799", 10);
+  const pair_code = document.getElementById("pairCode").value.trim();
+  const name = document.getElementById("pairName").value.trim();
+  if (!host || !pair_code) return showToast("Enter host/IP and 6-digit PIN.", true);
+  try {
+    const out = await api("/api/devices/pair", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ host, port, pair_code, name })
+    });
+    document.getElementById("pairCode").value = "";
+    showToast(`Paired ${out.name || host} cleanly.`);
+    await refreshDevices();
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function removeDevice(id) {
+  try {
+    await api("/api/devices/remove", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ device_id: id })
+    });
+    await refreshDevices();
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 function togglePop(id, ev) {
   if (ev) ev.stopPropagation();
@@ -821,6 +930,7 @@ function renderRun(rec) {
     ? results.map(r => ({
         agent_id: r.agent_id,
         title: r.title || r.ticket || r.agent_id,
+        device_name: r.device_name || "",
         stage: r.stage || (r.tests_ok ? "passed" : "failed"),
         snippet: r.error || (r.written_files && r.written_files.length ? r.written_files.join(", ") : "Done"),
         repair: r.repair_attempts || 0,
@@ -830,6 +940,7 @@ function renderRun(rec) {
     : Object.values(liveMap).map(l => ({
         agent_id: l.agent_id,
         title: l.title || l.agent_id,
+        device_name: l.device_name || "",
         stage: l.stage || "queued",
         snippet: l.snippet || "Working…",
         repair: 0,
@@ -939,6 +1050,7 @@ function renderRun(rec) {
               <span class="dot ${st === 'passed' ? 'ok' : (st === 'failed' ? 'err' : 'live')}"></span>
               <span class="badge ${bCls}">${escapeHtml(STAGE_LABEL[st] || st)}</span>
               ${n.repair > 0 ? `<span class="badge warn">fixed ×${n.repair}</span>` : ""}
+              ${n.device_name ? `<span class="badge">on ${escapeHtml(n.device_name)}</span>` : ""}
               <div class="spacer"></div>
               <span style="font-size:11px;color:var(--muted);">${escapeHtml(n.agent_id)}</span>
             </div>
@@ -1271,6 +1383,7 @@ async function init() {
   updateRepoUI();
   renderTickets();
   probeGpu();
+  refreshDevices();
   await refreshRuns();
   if (activeRunId && mode !== "ask") {
     try { await selectRun(activeRunId); } catch (_) {}
