@@ -224,6 +224,16 @@ class OpenSwarmMeteringTest(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_prepare_shell_cmd_rewrites_bare_python_and_sets_env(self) -> None:
+        import sys
+        from swarm_run import _prepare_shell_cmd_and_env
+
+        cmd, env = _prepare_shell_cmd_and_env("python -m unittest discover -s tests")
+        self.assertTrue(cmd.startswith(sys.executable) or cmd.startswith(f"'{sys.executable}'"))
+        self.assertIn("-m unittest discover -s tests", cmd)
+        self.assertEqual(env.get("PYTHONDONTWRITEBYTECODE"), "1")
+        self.assertIn(str(Path(sys.executable).parent), env.get("PATH", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

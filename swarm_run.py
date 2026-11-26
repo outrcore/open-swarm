@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -268,6 +269,18 @@ def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProce
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check)
 
 
+def _prepare_shell_cmd_and_env(cmd: str) -> tuple[str, dict[str, str]]:
+    """Ensure macOS Finder apps find python3 cleanly by rewriting leading python/python3 and enriching PATH."""
+    env = dict(os.environ)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    extra_bins = f"{Path(sys.executable).parent}:/usr/local/bin:/opt/homebrew/bin"
+    cur_path = env.get("PATH") or ""
+    env["PATH"] = f"{extra_bins}:{cur_path}" if cur_path else extra_bins
+    stripped = str(cmd or "").strip()
+    rewritten = re.sub(r"^\s*python3?(?=\s|$)", shlex.quote(sys.executable), stripped)
+    return rewritten, env
+
+
 def run_swarm(
     *,
     repo: Path,
@@ -463,10 +476,9 @@ def run_swarm(
                 for pc_dir in wt.rglob("__pycache__"):
                     if pc_dir.is_dir():
                         shutil.rmtree(pc_dir, ignore_errors=True)
-                accept_env = dict(os.environ)
-                accept_env["PYTHONDONTWRITEBYTECODE"] = "1"
+                accept_cmd, accept_env = _prepare_shell_cmd_and_env(item["acceptance_cmd"])
                 tproc = subprocess.run(
-                    item["acceptance_cmd"],
+                    accept_cmd,
                     cwd=str(wt),
                     shell=True,
                     env=accept_env,

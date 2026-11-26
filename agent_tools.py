@@ -431,6 +431,8 @@ def decompose_goal_to_tasks(
             "You are a principal software architect decomposing an engineering goal into "
             f"1 to {limit} non-overlapping parallel git-worktree tickets.\n"
             "Assign disjoint `owned_files` per ticket whenever possible to prevent merge collisions.\n"
+            "For Python repositories, always write stdlib unittest.TestCase tests and use "
+            "'python3 -m unittest <test_file_or_discover>' as acceptance_cmd — never assume pytest or bare 'python' is installed.\n"
             "Respond ONLY with a valid JSON array matching this exact schema:\n"
             '[{"title": "<short title>", "spec": "<clear implementation spec with tests>", '
             '"acceptance_cmd": "<shell test command>", '
