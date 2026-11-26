@@ -284,6 +284,9 @@ def run_swarm(
     auto_review: bool = False,
     continuity_store: Any = None,
     runs_dir: Path | None = None,
+    use_tool_loop: bool = False,
+    max_tool_turns: int = 8,
+    readonly_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute `tasks` in parallel isolated git worktrees and return metered diffs + test verdicts."""
     from agent_tools import build_agent_context_brief, detect_file_collisions
@@ -412,6 +415,8 @@ def run_swarm(
         _emit_agent("worktree", force=True)
         try:
             meter.check_cap()
+            item_readonly = list(item.get("readonly_paths") or readonly_paths or [])
+            item_use_tools = bool(item.get("use_tool_loop") if item.get("use_tool_loop") is not None else use_tool_loop)
             user_prompt = (
                 f"## Ticket {res_info['ticket']}: {title}\n"
                 f"{item['spec']}\n\n"
@@ -472,12 +477,52 @@ def run_swarm(
                 res_info["tests_ok"] = tproc.returncode == 0
                 res_info["test_output"] = (tproc.stdout + "\n" + tproc.stderr).strip()[-2000:]
 
-            resp = _run_turn()
-            for rel_w in apply_file_blocks(wt, resp["content"]):
-                if rel_w not in written:
-                    written.append(rel_w)
-            if written and item.get("acceptance_cmd"):
-                _run_accept()
+            resp: dict[str, Any] = {"content": "", "reasoning_content": ""}
+            if item_use_tools:
+                from agent_loop import run_agent_loop
+
+                tool_prompt = (
+                    f"## Ticket {res_info['ticket']}: {title}\n"
+                    f"{item['spec']}\n\n"
+                    f"Acceptance command: `{item['acceptance_cmd']}`\n"
+                    "Use `read_file` / `search_code` to inspect files first, make surgical edits via `edit_file` or `write_file`, "
+                    "verify using `run_command`, optionally log insights with `write_note`, and call `finish` when verified."
+                )
+                loop_res = run_agent_loop(
+                    worktree=wt,
+                    system_prompt=shared_sys,
+                    user_prompt=tool_prompt,
+                    base_url=item_base_url,
+                    api_key=api_key,
+                    model=item_model,
+                    agent_id=agent_id,
+                    readonly_paths=item_readonly,
+                    max_turns=int(item.get("max_tool_turns") or max_tool_turns),
+                    max_tokens=item_max_tokens,
+                    temperature=item_temp,
+                    meter=meter,
+                    on_progress=_emit_progress,
+                )
+                res_info["turns"] = int(loop_res.get("turns") or 0)
+                res_info["tool_calls"] = int(loop_res.get("tool_calls") or 0)
+                res_info["notes_path"] = loop_res.get("notes_path")
+                res_info["completion_tokens"] += int(loop_res.get("completion_tokens") or 0)
+                res_info["prompt_tokens"] += int(loop_res.get("prompt_tokens") or 0)
+                res_info["cached_tokens"] += int(loop_res.get("cached_tokens") or 0)
+                res_info["output_preview"] = str(loop_res.get("summary") or loop_res.get("error") or "")[-1200:]
+                for rel_w in loop_res.get("written_files") or []:
+                    if rel_w not in written:
+                        written.append(rel_w)
+                if item.get("acceptance_cmd"):
+                    _run_accept()
+                resp = {"content": res_info["output_preview"], "reasoning_content": ""}
+            else:
+                resp = _run_turn()
+                for rel_w in apply_file_blocks(wt, resp["content"]):
+                    if rel_w not in written:
+                        written.append(rel_w)
+                if written and item.get("acceptance_cmd"):
+                    _run_accept()
 
             repairs_allowed = max(0, int(max_repair_turns))
             while repairs_allowed > 0 and res_info["repair_attempts"] < repairs_allowed and (

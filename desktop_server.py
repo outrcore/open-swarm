@@ -43,6 +43,7 @@ from continuity_store import (  # noqa: E402
 )
 from fleet_scanner import scan_fleet  # noqa: E402
 from orchestrator import LANES, review_agent_diff, run_tournament  # noqa: E402
+from research_loop import ResearchConfig, run_research_swarm  # noqa: E402
 from swarm_run import openai_chat, run_swarm  # noqa: E402
 
 PRESETS: list[dict[str, str]] = [
@@ -136,6 +137,8 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         "fleet_scanner.py",
         "orchestrator.py",
         "agent_tools.py",
+        "agent_loop.py",
+        "research_loop.py",
     ):
         src = HERE / fname
         if src.is_file():
@@ -149,6 +152,8 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         "tests/test_fleet_scanner.py",
         "tests/test_orchestrator.py",
         "tests/test_agent_tools.py",
+        "tests/test_agent_loop.py",
+        "tests/test_research_loop.py",
     ):
         src = HERE / rel
         if src.is_file():
@@ -426,20 +431,64 @@ class DesktopAppState:
         auto_review: bool = True,
         judge_model: str | None = None,
         judge_base_url: str | None = None,
+        use_tool_loop: bool = False,
+        research_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         repo = Path(repo_path).expanduser().resolve()
         if not repo.is_dir():
             raise ValueError(f"Repository path does not exist: {repo}")
         if not (repo / ".git").exists():
             raise ValueError(f"Directory is not a git repository (.git missing): {repo}")
-        clean_goal = (goal or "").strip()
-        if not tasks and not clean_goal:
+        raw_mode = str(mode or "swarm").strip().lower()
+        run_mode = raw_mode if raw_mode in ("swarm", "tournament", "research") else "swarm"
+        rc_dict = dict(research_config or {})
+        clean_goal = (goal or str(rc_dict.get("goal") or "")).strip()
+
+        resolved_rc: ResearchConfig | None = None
+        if run_mode == "research":
+            eval_cmd = str(rc_dict.get("eval_cmd") or "").strip()
+            if not clean_goal:
+                raise ValueError("Enter a research optimization goal")
+            if not eval_cmd:
+                raise ValueError("Research mode requires an eval_cmd")
+            direction = str(rc_dict.get("direction") or "max").strip().lower()
+            if direction not in ("max", "min"):
+                direction = "max"
+            resolved_rc = ResearchConfig(
+                goal=clean_goal,
+                eval_cmd=eval_cmd,
+                health_cmd=str(rc_dict.get("health_cmd") or "").strip(),
+                metric_regex=str(
+                    rc_dict.get("metric_regex") or r"(?:score|metric|val_bpb|tok_s|ms)\s*[:=]\s*([-+]?\d+(?:\.\d+)?)"
+                ),
+                direction=direction,
+                editable_paths=[str(p).strip() for p in (rc_dict.get("editable_paths") or []) if str(p).strip()],
+                readonly_paths=[str(p).strip() for p in (rc_dict.get("readonly_paths") or []) if str(p).strip()],
+                islands=max(1, int(rc_dict.get("islands") or 2)),
+                rounds=max(1, int(rc_dict.get("rounds") or 3)),
+                cross_pollinate_every=max(1, int(rc_dict.get("cross_pollinate_every") or 2)),
+                spend_cap_usd=float(spend_cap_usd),
+                eval_timeout_s=max(1, int(rc_dict.get("eval_timeout_s") or 60)),
+                health_timeout_s=max(1, int(rc_dict.get("health_timeout_s") or 30)),
+                use_tool_loop=bool(rc_dict.get("use_tool_loop", True)),
+                max_tool_turns=max(1, int(rc_dict.get("max_tool_turns") or 6)),
+                max_tokens=int(max_tokens),
+            )
+        elif not tasks and not clean_goal:
             raise ValueError("Enter a goal or at least one agent ticket")
 
-        run_mode = "tournament" if str(mode).strip().lower() == "tournament" else "swarm"
         run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{int(time.time()*1000)%1000:03d}"
         now_ts = time.time()
-        if not tasks and clean_goal:
+        if run_mode == "research" and resolved_rc is not None:
+            live_specs = [
+                {
+                    "agent_id": f"island-{chr(ord('a') + i)}" if i < 26 else f"island-{i + 1}",
+                    "id": f"R-{i + 1:03d}",
+                    "title": f"Island {chr(ord('A') + i) if i < 26 else i + 1} (0/{resolved_rc.rounds})",
+                }
+                for i in range(resolved_rc.islands)
+            ]
+        elif not tasks and clean_goal:
             live_specs = [
                 {"agent_id": "architect", "id": "PLAN", "title": f"Planning: {clean_goal[:60]}"},
             ]
@@ -460,7 +509,7 @@ class DesktopAppState:
                 "agent_id": aid,
                 "ticket": ticket_id,
                 "title": str(t.get("title") or ticket_id),
-                "stage": "planning" if (not tasks and clean_goal) else "queued",
+                "stage": "planning" if (run_mode != "research" and not tasks and clean_goal) else "queued",
                 "reasoning_chars": 0,
                 "content_chars": 0,
                 "snippet": "",
@@ -479,20 +528,30 @@ class DesktopAppState:
             "max_tokens": int(max_tokens),
             "max_repair_turns": int(max_repair_turns),
             "auto_review": bool(auto_review),
+            "use_tool_loop": bool(use_tool_loop),
             "agents_count": len(live_specs),
             "passed_count": 0,
             "tasks": list(tasks),
             "results": [],
             "collisions": {},
             "agents_live": agents_live,
+            "experiments": [],
+            "baseline_score": None,
+            "best_score": None,
+            "best_island": None,
+            "direction": resolved_rc.direction if resolved_rc is not None else None,
             "events": [
                 {
                     "ts": now_ts,
-                    "kind": "planning" if (not tasks and clean_goal) else "run_start",
+                    "kind": "planning" if (run_mode != "research" and not tasks and clean_goal) else "run_start",
                     "msg": (
-                        "Decomposing goal into parallel agent tickets..."
-                        if (not tasks and clean_goal)
-                        else f"Queued {len(live_specs)} {'tournament candidates' if run_mode == 'tournament' else 'parallel agent(s)'}"
+                        f"Launching {resolved_rc.islands}-island Autoresearch ({resolved_rc.rounds} rounds)..."
+                        if run_mode == "research" and resolved_rc is not None
+                        else (
+                            "Decomposing goal into parallel agent tickets..."
+                            if (not tasks and clean_goal)
+                            else f"Queued {len(live_specs)} {'tournament candidates' if run_mode == 'tournament' else 'parallel agent(s)'}"
+                        )
                     ),
                 }
             ],
@@ -559,6 +618,37 @@ class DesktopAppState:
                         should_persist = True
                     elif (time.monotonic() - last_persist[0]) >= 1.5:
                         should_persist = True
+                elif ev_kind == "research_step":
+                    exps = cur.setdefault("experiments", [])
+                    step_rec = {
+                        "round": ev.get("round"),
+                        "island": ev.get("island"),
+                        "commit": ev.get("commit"),
+                        "score": ev.get("score"),
+                        "best_score": ev.get("best_score"),
+                        "eval_s": ev.get("eval_s", 0.0),
+                        "health_s": ev.get("health_s", 0.0),
+                        "llm_s": ev.get("llm_s", 0.0),
+                        "status": ev.get("status"),
+                        "description": ev.get("description"),
+                        "error": ev.get("error"),
+                    }
+                    exps.append(step_rec)
+                    b_score = step_rec.get("best_score")
+                    if b_score is not None:
+                        prev_b = cur.get("best_score")
+                        dir_m = cur.get("direction") or "max"
+                        if prev_b is None or (b_score > prev_b if dir_m == "max" else b_score < prev_b):
+                            cur["best_score"] = b_score
+                            cur["best_island"] = step_rec.get("island")
+                    cur.setdefault("events", []).append(
+                        {
+                            "ts": ev_ts,
+                            "kind": "research_step",
+                            "msg": f"{step_rec.get('island')} R{step_rec.get('round')}: {step_rec.get('status')} (score={step_rec.get('score')})",
+                        }
+                    )
+                    should_persist = True
                 if len(cur.get("events", [])) > 80:
                     cur["events"] = cur["events"][-80:]
                 if should_persist:
@@ -572,89 +662,102 @@ class DesktopAppState:
         def _worker() -> None:
             try:
                 resolved_tasks = list(tasks)
-                if not resolved_tasks and clean_goal:
-                    ctx_brief = build_agent_context_brief(
-                        repo, continuity=self.continuity, runs_dir=self.runs_dir
-                    )
-                    resolved_tasks = decompose_goal_to_tasks(
+                if run_mode == "research" and resolved_rc is not None:
+                    rec = run_research_swarm(
                         repo=repo,
-                        goal=clean_goal,
+                        config=resolved_rc,
                         base_url=backend_url,
                         model=model,
                         api_key=api_key or "outrcore-swarm",
-                        continuity_brief=ctx_brief,
-                        max_agents=1 if run_mode == "tournament" else 3,
-                    )
-                    with self._lock:
-                        cur = self._runs.get(run_id)
-                        if cur:
-                            cur["tasks"] = resolved_tasks
-                            cur["agents_count"] = 3 if run_mode == "tournament" else len(resolved_tasks)
-                            plan_specs = (
-                                [
-                                    {"agent_id": "cand-a", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [minimal-patch]"},
-                                    {"agent_id": "cand-b", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [defensive-edge-cases]"},
-                                    {"agent_id": "cand-c", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [clean-modular]"},
-                                ]
-                                if run_mode == "tournament"
-                                else resolved_tasks
-                            )
-                            cur["agents_live"] = {
-                                str(t.get("agent_id") or f"coder-{chr(ord('a') + idx)}"): {
-                                    "agent_id": str(t.get("agent_id") or f"coder-{chr(ord('a') + idx)}"),
-                                    "ticket": str(t.get("id") or f"T-{idx+1:03d}"),
-                                    "title": str(t.get("title") or f"T-{idx+1:03d}"),
-                                    "stage": "queued",
-                                    "reasoning_chars": 0,
-                                    "content_chars": 0,
-                                    "snippet": "",
-                                    "updated_at": time.time(),
-                                }
-                                for idx, t in enumerate(plan_specs)
-                            }
-                            cur.setdefault("events", []).append(
-                                {"ts": time.time(), "kind": "plan_ready", "msg": f"Planned {len(resolved_tasks)} ticket(s) from goal"}
-                            )
-
-                if run_mode == "tournament":
-                    rec = run_tournament(
-                        repo=repo,
-                        ticket=resolved_tasks[0],
-                        base_url=backend_url,
-                        model=model,
-                        judge_base_url=judge_base_url or backend_url,
-                        judge_model=judge_model or model,
-                        api_key=api_key or "outrcore-swarm",
-                        spend_cap_usd=float(spend_cap_usd),
-                        max_tokens=int(max_tokens),
                         keep_worktrees=True,
                         on_progress=_on_progress,
-                        runner_fn=self.runner_fn,
+                        continuity_store=self.continuity,
                     )
                 else:
-                    call_kwargs: dict[str, Any] = {
-                        "repo": repo,
-                        "tasks": resolved_tasks,
-                        "base_url": backend_url,
-                        "model": model,
-                        "api_key": api_key or "outrcore-swarm",
-                        "spend_cap_usd": float(spend_cap_usd),
-                        "max_tokens": int(max_tokens),
-                        "keep_worktrees": True,
-                        "on_progress": _on_progress,
-                    }
-                    sig = inspect.signature(self.runner_fn)
-                    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-                    extras = {
-                        "max_repair_turns": int(max_repair_turns),
-                        "auto_review": bool(auto_review),
-                        "continuity_store": self.continuity,
-                        "runs_dir": self.runs_dir,
-                    }
-                    for k, v in extras.items():
-                        if has_varkw or k in sig.parameters:
-                            call_kwargs[k] = v
-                    rec = self.runner_fn(**call_kwargs)
+                    if not resolved_tasks and clean_goal:
+                        ctx_brief = build_agent_context_brief(
+                            repo, continuity=self.continuity, runs_dir=self.runs_dir
+                        )
+                        resolved_tasks = decompose_goal_to_tasks(
+                            repo=repo,
+                            goal=clean_goal,
+                            base_url=backend_url,
+                            model=model,
+                            api_key=api_key or "outrcore-swarm",
+                            continuity_brief=ctx_brief,
+                            max_agents=1 if run_mode == "tournament" else 3,
+                        )
+                        with self._lock:
+                            cur = self._runs.get(run_id)
+                            if cur:
+                                cur["tasks"] = resolved_tasks
+                                cur["agents_count"] = 3 if run_mode == "tournament" else len(resolved_tasks)
+                                plan_specs = (
+                                    [
+                                        {"agent_id": "cand-a", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [minimal-patch]"},
+                                        {"agent_id": "cand-b", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [defensive-edge-cases]"},
+                                        {"agent_id": "cand-c", "id": "T-001", "title": f"{resolved_tasks[0].get('title', 'T1')} [clean-modular]"},
+                                    ]
+                                    if run_mode == "tournament"
+                                    else resolved_tasks
+                                )
+                                cur["agents_live"] = {
+                                    str(t.get("agent_id") or f"coder-{chr(ord('a') + idx)}"): {
+                                        "agent_id": str(t.get("agent_id") or f"coder-{chr(ord('a') + idx)}"),
+                                        "ticket": str(t.get("id") or f"T-{idx+1:03d}"),
+                                        "title": str(t.get("title") or f"T-{idx+1:03d}"),
+                                        "stage": "queued",
+                                        "reasoning_chars": 0,
+                                        "content_chars": 0,
+                                        "snippet": "",
+                                        "updated_at": time.time(),
+                                    }
+                                    for idx, t in enumerate(plan_specs)
+                                }
+                                cur.setdefault("events", []).append(
+                                    {"ts": time.time(), "kind": "plan_ready", "msg": f"Planned {len(resolved_tasks)} ticket(s) from goal"}
+                                )
+
+                    if run_mode == "tournament":
+                        rec = run_tournament(
+                            repo=repo,
+                            ticket=resolved_tasks[0],
+                            base_url=backend_url,
+                            model=model,
+                            judge_base_url=judge_base_url or backend_url,
+                            judge_model=judge_model or model,
+                            api_key=api_key or "outrcore-swarm",
+                            spend_cap_usd=float(spend_cap_usd),
+                            max_tokens=int(max_tokens),
+                            keep_worktrees=True,
+                            on_progress=_on_progress,
+                            runner_fn=self.runner_fn,
+                        )
+                    else:
+                        call_kwargs: dict[str, Any] = {
+                            "repo": repo,
+                            "tasks": resolved_tasks,
+                            "base_url": backend_url,
+                            "model": model,
+                            "api_key": api_key or "outrcore-swarm",
+                            "spend_cap_usd": float(spend_cap_usd),
+                            "max_tokens": int(max_tokens),
+                            "keep_worktrees": True,
+                            "on_progress": _on_progress,
+                        }
+                        sig = inspect.signature(self.runner_fn)
+                        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                        extras = {
+                            "max_repair_turns": int(max_repair_turns),
+                            "auto_review": bool(auto_review),
+                            "use_tool_loop": bool(use_tool_loop),
+                            "continuity_store": self.continuity,
+                            "runs_dir": self.runs_dir,
+                        }
+                        for k, v in extras.items():
+                            if has_varkw or k in sig.parameters:
+                                call_kwargs[k] = v
+                        rec = self.runner_fn(**call_kwargs)
                 with self._lock:
                     cur = self._runs.get(run_id, initial)
                     cur_events = list(cur.get("events") or [])
@@ -1293,6 +1396,22 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
             if path == "/api/runs":
                 try:
                     defaults = load_presets()
+                    rc_payload = dict(body.get("research_config") or {})
+                    for rk in (
+                        "eval_cmd",
+                        "health_cmd",
+                        "metric_regex",
+                        "direction",
+                        "editable_paths",
+                        "readonly_paths",
+                        "islands",
+                        "rounds",
+                        "cross_pollinate_every",
+                        "use_tool_loop",
+                        "max_tool_turns",
+                    ):
+                        if rk in body and rk not in rc_payload:
+                            rc_payload[rk] = body[rk]
                     rec = state.start_run(
                         repo_path=str(body.get("repo") or _default_repo_path()),
                         backend_url=str(body.get("backend_url") or defaults[0]["backend_url"]),
@@ -1307,6 +1426,8 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                         auto_review=bool(body.get("auto_review", True)),
                         judge_model=(str(body["judge_model"]).strip() if body.get("judge_model") else None),
                         judge_base_url=(str(body["judge_base_url"]).strip() if body.get("judge_base_url") else None),
+                        use_tool_loop=bool(body.get("use_tool_loop", False)),
+                        research_config=rc_payload or None,
                     )
                     self._send_json(202, rec)
                 except ValueError as exc:

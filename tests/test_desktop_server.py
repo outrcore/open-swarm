@@ -588,6 +588,104 @@ class DesktopServerTests(unittest.TestCase):
             mock_srv.shutdown()
             mock_srv.server_close()
 
+    def test_research_mode_run_sparkline_and_apply_best(self) -> None:
+        (self.repo_dir / "kernel.py").write_text("def score_val():\n    return 10\n", encoding="utf-8")
+        (self.repo_dir / "eval_bench.py").write_text(
+            "from kernel import score_val\nprint(f'score: {score_val()}')\n",
+            encoding="utf-8",
+        )
+        (self.repo_dir / "test_kernel.py").write_text(
+            "import time, unittest\nfrom kernel import score_val\nclass T(unittest.TestCase):\n    def test_pos(self):\n        time.sleep(0.12)\n        self.assertGreater(score_val(), 0)\nif __name__ == '__main__':\n    unittest.main()\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "add", "-A"], cwd=str(self.repo_dir), check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "Add kernel benchmark"], cwd=str(self.repo_dir), check=True, capture_output=True)
+
+        class _ResearchMockHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                _ = self.rfile.read(n)
+                raw = json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": (
+                                        "Optimize score_val\n"
+                                        "```file:kernel.py\n"
+                                        "def score_val():\n"
+                                        "    return 42\n"
+                                        "```\n"
+                                    ),
+                                }
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 20, "cached_tokens": 10, "completion_tokens": 18},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        mock_srv = ThreadingHTTPServer(("127.0.0.1", 0), _ResearchMockHandler)
+        m_port = mock_srv.server_address[1]
+        threading.Thread(target=mock_srv.serve_forever, daemon=True).start()
+        try:
+            st_r, rec = _http_json(
+                f"{self.base}/api/runs",
+                method="POST",
+                payload={
+                    "repo": str(self.repo_dir),
+                    "backend_url": f"http://127.0.0.1:{m_port}/v1",
+                    "model": "test-model",
+                    "mode": "research",
+                    "goal": "Maximize kernel score_val",
+                    "research_config": {
+                        "eval_cmd": f"{sys.executable} eval_bench.py",
+                        "health_cmd": f"{sys.executable} -m unittest test_kernel.py",
+                        "editable_paths": ["kernel.py"],
+                        "readonly_paths": ["eval_bench.py", "test_kernel.py"],
+                        "direction": "max",
+                        "islands": 2,
+                        "rounds": 1,
+                        "use_tool_loop": False,
+                    },
+                },
+            )
+            self.assertEqual(st_r, 202)
+            rid = rec["run_id"]
+            final = rec
+            for _ in range(80):
+                _, final = _http_json(f"{self.base}/api/runs/{rid}")
+                if final["status"] in ("completed", "error"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(final["status"], "completed", final.get("error"))
+            self.assertEqual(final["mode"], "research")
+            self.assertEqual(final["baseline_score"], 10.0)
+            self.assertEqual(final["best_score"], 42.0)
+            self.assertEqual(len(final["experiments"]), 2)
+            self.assertLess(final["experiments"][0]["eval_s"], 0.10)
+            self.assertGreaterEqual(final["experiments"][0]["health_s"], 0.10)
+            self.assertIn("Live Score Sparkline", urllib.request.urlopen(f"{self.base}/", timeout=5.0).read().decode("utf-8"))
+
+            st_ap, ap = _http_json(
+                f"{self.base}/api/runs/{rid}/apply",
+                method="POST",
+                payload={"agent_id": final["best_island"]},
+            )
+            self.assertEqual(st_ap, 200)
+            self.assertIn("42", (self.repo_dir / "kernel.py").read_text(encoding="utf-8"))
+        finally:
+            mock_srv.shutdown()
+            mock_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

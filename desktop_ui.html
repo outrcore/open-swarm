@@ -303,6 +303,7 @@
         <div class="seg">
           <button id="segSwarm" class="active" onclick="setMode('swarm')">Swarm</button>
           <button id="segTournament" onclick="setMode('tournament')">Tournament</button>
+          <button id="segResearch" onclick="setMode('research')">Research</button>
           <button id="segAsk" onclick="setMode('ask')">Ask</button>
         </div>
         <div class="spacer"></div>
@@ -310,6 +311,56 @@
         <button class="primary" id="runBtn" onclick="handlePrimaryAction()">Run</button>
       </div>
     </section>
+
+    <div class="adv-box" id="researchBox">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+        <b style="font-size:12.5px;">Autoresearch Loop (Tests Timed Separately From Benchmark)</b>
+        <span style="font-size:11px;color:var(--muted);">Monotonic Git Ratchet</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <div class="pop-field">
+          <label>Benchmark Eval Command</label>
+          <input id="resEvalCmd" style="font-family:var(--mono);" value="python3 eval_bench.py" onchange="savePrefs()" placeholder="python3 eval_bench.py" />
+        </div>
+        <div class="pop-field">
+          <label>Unit Test / Health Command (Optional, Untimed)</label>
+          <input id="resHealthCmd" style="font-family:var(--mono);" value="python3 -m unittest discover -s tests -v" onchange="savePrefs()" placeholder="python3 -m unittest ..." />
+        </div>
+        <div class="pop-field">
+          <label>Editable Paths (Comma-Separated)</label>
+          <input id="resEditable" style="font-family:var(--mono);" onchange="savePrefs()" placeholder="kernel.py, src/" />
+        </div>
+        <div class="pop-field">
+          <label>Read-Only Protected Paths</label>
+          <input id="resReadonly" style="font-family:var(--mono);" value="eval_bench.py, tests/" onchange="savePrefs()" placeholder="eval_bench.py, tests/" />
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1.2fr 1.5fr 0.7fr 0.7fr 0.7fr;gap:8px;">
+        <div class="pop-field" style="margin-bottom:0;">
+          <label>Direction</label>
+          <select id="resDirection" onchange="savePrefs()">
+            <option value="max">Higher is better (max)</option>
+            <option value="min">Lower is better (min)</option>
+          </select>
+        </div>
+        <div class="pop-field" style="margin-bottom:0;">
+          <label>Metric Regex</label>
+          <input id="resRegex" style="font-family:var(--mono);" value="(?:score|metric|val_bpb|tok_s|ms)\s*[:=]\s*([-+]?\d+(?:\.\d+)?)" onchange="savePrefs()" />
+        </div>
+        <div class="pop-field" style="margin-bottom:0;">
+          <label>Islands</label>
+          <input id="resIslands" type="number" min="1" max="8" value="2" onchange="savePrefs()" />
+        </div>
+        <div class="pop-field" style="margin-bottom:0;">
+          <label>Rounds</label>
+          <input id="resRounds" type="number" min="1" max="20" value="3" onchange="savePrefs()" />
+        </div>
+        <div class="pop-field" style="margin-bottom:0;">
+          <label>Share / N</label>
+          <input id="resCross" type="number" min="1" max="10" value="2" onchange="savePrefs()" />
+        </div>
+      </div>
+    </div>
 
     <div class="quick-row">
       <button class="quick-chip" onclick="loadSelfBuildSwarm()">Self-Build Open Swarm</button>
@@ -430,9 +481,15 @@ const STAGE_LABEL = {
   thinking: "Thinking",
   coding: "Writing",
   testing: "Testing",
+  evaluating: "Benchmarking",
   repairing: "Self-Fixing",
   reviewing: "Reviewing",
   passed: "Verified",
+  keep: "Kept",
+  revert: "Reverted",
+  health_failed: "Tests Failed",
+  eval_failed: "Eval Failed",
+  tamper_reverted: "Protected",
   failed: "Needs Fix"
 };
 
@@ -500,6 +557,15 @@ function savePrefs() {
       repairTurns: document.getElementById("repairTurns").value,
       autoReview: document.getElementById("autoReview").checked,
       darkMode: document.getElementById("darkToggle").checked,
+      resEvalCmd: document.getElementById("resEvalCmd").value,
+      resHealthCmd: document.getElementById("resHealthCmd").value,
+      resEditable: document.getElementById("resEditable").value,
+      resReadonly: document.getElementById("resReadonly").value,
+      resDirection: document.getElementById("resDirection").value,
+      resRegex: document.getElementById("resRegex").value,
+      resIslands: document.getElementById("resIslands").value,
+      resRounds: document.getElementById("resRounds").value,
+      resCross: document.getElementById("resCross").value,
       mode,
       activeRunId,
       tickets,
@@ -515,11 +581,15 @@ function setMode(m) {
   mode = m;
   document.getElementById("segSwarm").classList.toggle("active", m === "swarm");
   document.getElementById("segTournament").classList.toggle("active", m === "tournament");
+  document.getElementById("segResearch").classList.toggle("active", m === "research");
   document.getElementById("segAsk").classList.toggle("active", m === "ask");
+  document.getElementById("researchBox").classList.toggle("show", m === "research");
   document.getElementById("runBtn").textContent = m === "ask" ? "Ask" : "Run";
   document.getElementById("goalInput").placeholder = m === "ask"
     ? "Ask your GPU model anything… (⌘↩ to send)"
-    : (m === "tournament" ? "Describe one hard task for 3 competing agents + blind judge… (⌘↩)" : "Describe what you want built, fixed, or tested… (⌘↩ to run)");
+    : (m === "research"
+        ? "Describe the optimization goal (e.g., speed up kernel.py while keeping tests passing)… (⌘↩)"
+        : (m === "tournament" ? "Describe one hard task for 3 competing agents + blind judge… (⌘↩)" : "Describe what you want built, fixed, or tested… (⌘↩ to run)"));
   document.getElementById("runStage").style.display = m === "ask" ? "none" : (activeRunId ? "block" : "none");
   document.getElementById("chatStage").classList.toggle("show", m === "ask" && chatHistory.length > 0);
   savePrefs();
@@ -679,8 +749,19 @@ async function launchRun() {
         max_repair_turns: parseInt(document.getElementById("repairTurns").value || "2", 10),
         auto_review: document.getElementById("autoReview").checked,
         mode,
-        goal: explicitTasks.length ? "" : goalTxt,
-        tasks: explicitTasks
+        goal: (mode === "research" || !explicitTasks.length) ? goalTxt : "",
+        tasks: mode === "research" ? [] : explicitTasks,
+        research_config: mode === "research" ? {
+          eval_cmd: document.getElementById("resEvalCmd").value.trim(),
+          health_cmd: document.getElementById("resHealthCmd").value.trim(),
+          editable_paths: document.getElementById("resEditable").value.split(",").map(s => s.trim()).filter(Boolean),
+          readonly_paths: document.getElementById("resReadonly").value.split(",").map(s => s.trim()).filter(Boolean),
+          direction: document.getElementById("resDirection").value,
+          metric_regex: document.getElementById("resRegex").value.trim(),
+          islands: parseInt(document.getElementById("resIslands").value || "2", 10),
+          rounds: parseInt(document.getElementById("resRounds").value || "3", 10),
+          cross_pollinate_every: parseInt(document.getElementById("resCross").value || "2", 10)
+        } : undefined
       })
     });
     activeRunId = rec.run_id;
@@ -787,6 +868,54 @@ function renderRun(rec) {
 
   const unappliedPassed = results.filter(r => r.tests_ok && r.diff && !applied.has(r.agent_id)).length;
   const winnerId = t && t.winner_agent_id;
+  const bestResearchId = rec.mode === "research" ? rec.best_island : null;
+  const bestResearchResult = bestResearchId ? results.find(r => r.agent_id === bestResearchId) : null;
+
+  const researchHtml = rec.mode === "research" ? (() => {
+    const exps = rec.experiments || [];
+    const baseVal = rec.baseline_score;
+    const bestVal = rec.best_score;
+    const nums = [];
+    if (baseVal != null && isFinite(baseVal)) nums.push(Number(baseVal));
+    exps.forEach(e => {
+      if (e.score != null && isFinite(e.score)) nums.push(Number(e.score));
+      if (e.best_score != null && isFinite(e.best_score)) nums.push(Number(e.best_score));
+    });
+    const minV = nums.length ? Math.min(...nums) : 0;
+    const maxV = nums.length ? Math.max(...nums) : 1;
+    const span = Math.max(1e-9, maxV - minV);
+    const W = 560, H = 96, pad = 12;
+    const yFor = v => Math.round(H - pad - ((Number(v) - minV) / span) * (H - 2 * pad));
+    const pts = exps.map((e, idx) => {
+      const x = exps.length <= 1 ? W / 2 : Math.round(pad + (idx / (exps.length - 1)) * (W - 2 * pad));
+      const val = (e.score != null && isFinite(e.score)) ? Number(e.score) : (e.best_score != null ? Number(e.best_score) : minV);
+      const y = yFor(val);
+      const col = e.status === "keep" ? "#248a3d" : (e.status === "revert" ? "#8e8e93" : "#d93829");
+      return { x, y, col, e };
+    });
+    const poly = pts.map(p => `${p.x},${p.y}`).join(" ");
+    const baseY = baseVal != null ? yFor(baseVal) : null;
+    const sumEval = exps.reduce((a, b) => a + Number(b.eval_s || 0), 0);
+    const sumHealth = exps.reduce((a, b) => a + Number(b.health_s || 0), 0);
+    const sumLlm = exps.reduce((a, b) => a + Number(b.llm_s || 0), 0);
+    return `
+      <div class="detail-card" style="margin-top:12px;">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+          <b style="font-size:12.5px;">Live Score Sparkline</b>
+          ${baseVal != null ? `<span class="badge">Baseline: ${Number(baseVal).toFixed(3).replace(/\.?0+$/, "")}</span>` : ""}
+          ${bestVal != null ? `<span class="badge ok">Best: ${Number(bestVal).toFixed(3).replace(/\.?0+$/, "")}${bestResearchId ? ` (${escapeHtml(bestResearchId)})` : ""}</span>` : ""}
+          <div class="spacer"></div>
+          <span class="badge">Eval ${sumEval.toFixed(2)}s</span>
+          <span class="badge">Tests ${sumHealth.toFixed(2)}s</span>
+          <span class="badge">LLM ${sumLlm.toFixed(2)}s</span>
+        </div>
+        <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:96px;background:var(--surface-2);border-radius:10px;display:block;">
+          ${baseY != null ? `<line x1="${pad}" y1="${baseY}" x2="${W - pad}" y2="${baseY}" stroke="#8e8e93" stroke-width="1" stroke-dasharray="4 4" />` : ""}
+          ${pts.length > 1 ? `<polyline fill="none" stroke="#0071e3" stroke-width="2" points="${poly}" />` : ""}
+          ${pts.map(p => `<circle cx="${p.x}" cy="${p.y}" r="4.2" fill="${p.col}" stroke="#ffffff" stroke-width="1.2"><title>${escapeHtml(p.e.island)} R${p.e.round}: ${escapeHtml(p.e.status)} (${p.e.score ?? "NA"})</title></circle>`).join("")}
+        </svg>
+      </div>`;
+  })() : "";
 
   stageEl.innerHTML = `
     <div class="hub-card">
@@ -820,17 +949,22 @@ function renderRun(rec) {
       }).join("")}
     </div>
     ${winnerHtml}
+    ${researchHtml}
     ${rec.error ? `<div class="detail-card" style="margin-top:12px;border-color:rgba(217,56,41,0.35);color:var(--red);">${escapeHtml(rec.error)}</div>` : ""}
     ${rec.status === "completed" ? `
       <div class="action-bar">
-        ${winnerId && !applied.has(winnerId)
-          ? `<button class="primary" onclick="applyOne('${rec.run_id}','${winnerId}')">Apply Winner</button>`
-          : `<button class="primary" onclick="applyAll('${rec.run_id}')" ${unappliedPassed ? "" : "disabled"}>${unappliedPassed ? `Apply All Verified (${unappliedPassed})` : "All Verified Applied"}</button>`}
+        ${bestResearchId && bestResearchResult && bestResearchResult.diff && !applied.has(bestResearchId)
+          ? `<button class="primary" onclick="applyOne('${rec.run_id}','${bestResearchId}')">Apply Best Commit</button>`
+          : (winnerId && !applied.has(winnerId)
+              ? `<button class="primary" onclick="applyOne('${rec.run_id}','${winnerId}')">Apply Winner</button>`
+              : `<button class="primary" onclick="applyAll('${rec.run_id}')" ${unappliedPassed ? "" : "disabled"}>${unappliedPassed ? `Apply All Verified (${unappliedPassed})` : "All Verified Applied"}</button>`)}
         <button onclick="openPreview()">Preview</button>
         <button class="ghost" onclick="showDetails=!showDetails;renderRun(window._lastRun)">Inspect Details ${showDetails ? "▴" : "▾"}</button>
       </div>
     ` : ""}
     <div class="details-wrap ${showDetails ? "show" : ""}">
+      ${rec.artifacts && rec.artifacts.findings_md ? `<div class="detail-card"><b>Research Findings (.open_swarm/findings.md)</b><pre class="code-box">${escapeHtml(rec.artifacts.findings_md)}</pre></div>` : ""}
+      ${rec.artifacts && rec.artifacts.results_tsv ? `<div class="detail-card"><b>Experiment Log (.open_swarm/results.tsv)</b><pre class="code-box">${escapeHtml(rec.artifacts.results_tsv)}</pre></div>` : ""}
       ${results.map(a => `
         <div class="detail-card">
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
@@ -1114,6 +1248,15 @@ async function init() {
     if (saved.spendCap) document.getElementById("spendCap").value = saved.spendCap;
     if (saved.repairTurns != null) document.getElementById("repairTurns").value = saved.repairTurns;
     if (saved.autoReview != null) document.getElementById("autoReview").checked = saved.autoReview;
+    if (saved.resEvalCmd) document.getElementById("resEvalCmd").value = saved.resEvalCmd;
+    if (saved.resHealthCmd != null) document.getElementById("resHealthCmd").value = saved.resHealthCmd;
+    if (saved.resEditable != null) document.getElementById("resEditable").value = saved.resEditable;
+    if (saved.resReadonly != null) document.getElementById("resReadonly").value = saved.resReadonly;
+    if (saved.resDirection) document.getElementById("resDirection").value = saved.resDirection;
+    if (saved.resRegex) document.getElementById("resRegex").value = saved.resRegex;
+    if (saved.resIslands) document.getElementById("resIslands").value = saved.resIslands;
+    if (saved.resRounds) document.getElementById("resRounds").value = saved.resRounds;
+    if (saved.resCross) document.getElementById("resCross").value = saved.resCross;
     if (saved.darkMode) {
       document.getElementById("darkToggle").checked = true;
       document.documentElement.setAttribute("data-theme", "dark");
