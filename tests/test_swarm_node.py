@@ -146,12 +146,12 @@ class TestSwarmNodeBindSafety(unittest.TestCase):
             swarm_node.validate_bind_host("192.168.1.50")
 
         self.assertEqual(swarm_node.validate_bind_host("127.0.0.1"), "127.0.0.1")
-        self.assertEqual(swarm_node.validate_bind_host("100.94.164.64"), "100.94.164.64")
+        self.assertEqual(swarm_node.validate_bind_host("100.100.10.10"), "100.100.10.10")
         self.assertEqual(swarm_node.validate_bind_host("0.0.0.0", allow_lan=True), "0.0.0.0")
 
     def test_is_tailscale_ip(self):
         self.assertTrue(swarm_node.is_tailscale_ip("100.64.0.1"))
-        self.assertTrue(swarm_node.is_tailscale_ip("100.94.164.64"))
+        self.assertTrue(swarm_node.is_tailscale_ip("100.100.10.10"))
         self.assertTrue(swarm_node.is_tailscale_ip("100.127.255.254"))
         self.assertFalse(swarm_node.is_tailscale_ip("100.63.255.255"))
         self.assertFalse(swarm_node.is_tailscale_ip("100.128.0.1"))
@@ -165,12 +165,12 @@ class TestSwarmNodeBindSafety(unittest.TestCase):
         mock_proc = subprocess.CompletedProcess(
             args=["tailscale", "ip", "-4"],
             returncode=0,
-            stdout="100.94.164.64\n",
+            stdout="100.100.10.10\n",
             stderr="",
         )
         with patch.object(swarm_node, "_find_tailscale_cli", return_value="/usr/local/bin/tailscale"):
             with patch("subprocess.run", return_value=mock_proc):
-                self.assertEqual(swarm_node.detect_default_bind_host(), "100.94.164.64")
+                self.assertEqual(swarm_node.detect_default_bind_host(), "100.100.10.10")
 
 
 class TestSwarmNodePairingAndAuth(unittest.TestCase):
