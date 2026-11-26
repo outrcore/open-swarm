@@ -13,9 +13,10 @@ An Apple-clean, agent-first native macOS desktop app and zero-dependency Python 
 ## Highlights
 
 - **Zero-dependency Python stdlib engine** (no pip bloat) + lightweight native macOS Swift/WebKit shell (`Open Swarm.app`)
+- **Multi-Turn Agent Tool Loop (M1)** — worktree-confined `read_file`, `search_code`, surgical `edit_file`, `write_file`, pycache-clean `run_command`, `.open_swarm/notes/<agent_id>.md` scratchpads, harness-enforced `readonly_paths`, and KV-cache-preserving context compaction
+- **Karpathy Autoresearch Swarm (M2)** — multi-island git worktree evolution with `.open_swarm/{program.md,results.tsv,findings.md}`, **strictly isolated `eval_cmd` vs untimed `health_cmd` unit tests**, SHA-256 tamper protection, monotonic git ratchet, Shepherd cross-pollination, and a live SVG Score Sparkline
 - **Parallel Git Worktree Isolation** + deterministic **Shared KV Prefix Caching** + **AST Repo Symbol Indexing**
-- **Autonomous Self-Healing Loop** — workers automatically inspect failing test output and repair patches before surfacing diffs
-- **Blind Tournament Mode & Critic Review** — multi-stance worktrees, automatic test disqualification, author-independent diff critic, and blind judge
+- **Autonomous Self-Healing Loop & Tournament Mode** — workers inspect failing test output and repair patches automatically, plus multi-stance candidates, author-independent Critic review, and a blind judge
 - **Built-in SQLite Continuity & Context Guard** — SHA-256 pre-apply guard against external edits, action journal, and advisory agent blackboard
 - **BYO OpenAI-Compatible Backend** — OutrCore Cloud (`https://api.outrcore.com/v1`), local `k5cuda` / `vLLM` / `Ollama`, or custom `~/.open_swarm/presets.json` / `OPEN_SWARM_BACKEND_URL`
 
@@ -108,6 +109,22 @@ Additional optional environment variables:
 
 - `OPEN_SWARM_STATE_DIR` — Override the local state/runs directory (defaults to `~/.open_swarm/runs`).
 - `OPEN_SWARM_DEFAULT_REPO` — Default git repository path pre-selected in the desktop UI.
+
+---
+
+## Use OutrCore Cloud (`api.outrcore.com`) with Open Swarm & BYOK Coding Agents
+
+Point any OpenAI-compatible coding agent at `https://api.outrcore.com/v1` to leverage persistent KV prefix caching across agent turns:
+
+- **Open Swarm:** Built-in Preset #1 (`OutrCore Cloud`).
+- **Cline / Roo Code:** Provider = `OpenAI Compatible`, Base URL = `https://api.outrcore.com/v1`, Model = `thinkingmachines/Inkling-2-Mini`.
+- **Continue (`~/.continue/config.yaml`):** `provider: openai`, `apiBase: https://api.outrcore.com/v1`, `model: thinkingmachines/Inkling-2-Mini`.
+- **Aider:**
+  ```bash
+  export OPENAI_API_BASE=https://api.outrcore.com/v1
+  export OPENAI_API_KEY=<your-key>
+  aider --model openai/thinkingmachines/Inkling-2-Mini
+  ```
 
 ---
 
