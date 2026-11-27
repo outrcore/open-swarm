@@ -821,7 +821,7 @@ class DesktopServerTests(unittest.TestCase):
         self.assertIn('name="open-swarm-csrf"', html)
         st_cfg, cfg = _http_json(f"{self.base}/api/config")
         self.assertEqual(st_cfg, 200)
-        self.assertEqual(cfg["version"], "0.4.0")
+        self.assertEqual(cfg["version"], "0.5.0")
         csrf_tok = cfg["csrf_token"]
 
         # 2) Bad Host, bad Origin, and browser Origin without X-OpenSwarm-CSRF are blocked (403)
@@ -975,6 +975,29 @@ class DesktopServerTests(unittest.TestCase):
         st_cxl, cxl = _http_json(f"{self.base}/api/runs/gate-run-1/cancel", method="POST", payload={})
         self.assertEqual(st_cxl, 200)
         self.assertTrue(cxl["ok"])
+
+        # 7) Export redacted run trace (v0.5.0)
+        rec_secret = dict(self.state.get_run("gate-run-1") or {})
+        rec_secret["results"] = [
+            {
+                "agent_id": "coder-a",
+                "turns": 4,
+                "tool_calls": 9,
+                "repair_attempts": 1,
+                "loop_warnings": 1,
+                "tool_histogram": {"read_file": 3, "edit_file": 2, "run_command": 4},
+                "test_output": "token leaked sk-proj-secrettrace12345678",
+            }
+        ]
+        self.state._save_run(rec_secret)
+        st_exp, exp = _http_json(f"{self.base}/api/runs/gate-run-1/export")
+        self.assertEqual(st_exp, 200)
+        self.assertEqual(exp["version"], "0.5.0")
+        self.assertEqual(exp["summary_metrics"]["total_turns"], 4)
+        self.assertEqual(exp["summary_metrics"]["total_tool_calls"], 9)
+        self.assertEqual(exp["summary_metrics"]["tool_histogram"]["run_command"], 4)
+        self.assertNotIn("sk-proj-secrettrace12345678", json.dumps(exp))
+        self.assertIn("[REDACTED]", exp["run"]["results"][0]["test_output"])
 
 
 if __name__ == "__main__":

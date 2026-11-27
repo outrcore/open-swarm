@@ -28,7 +28,7 @@ import urllib.error
 from urllib.parse import parse_qs, urlsplit
 import urllib.request
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -146,6 +146,7 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         "research_loop.py",
         "device_mesh.py",
         "swarm_node.py",
+        "open_swarm_cli.py",
     ):
         src = HERE / fname
         if src.is_file():
@@ -1452,6 +1453,48 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                 return
             if path == "/api/runs":
                 self._send_json(200, {"runs": state.list_runs()})
+                return
+            if path.startswith("/api/runs/") and path.endswith("/export"):
+                from agent_loop import scrub_secrets
+
+                run_id = path[len("/api/runs/") : -len("/export")].strip("/")
+                rec = state.get_run(run_id)
+                if not rec:
+                    self._send_json(404, {"error": f"run {run_id} not found"})
+                    return
+                redacted = json.loads(scrub_secrets(json.dumps(rec)))
+                board_msgs = json.loads(scrub_secrets(json.dumps(state.continuity.read_board_messages(run_id))))
+                leases = state.continuity.list_file_leases(run_id)
+                tool_hist: dict[str, int] = {}
+                total_turns = 0
+                total_tools = 0
+                total_repairs = 0
+                total_loop_warns = 0
+                for r in redacted.get("results") or []:
+                    total_turns += int(r.get("turns") or 0)
+                    total_tools += int(r.get("tool_calls") or 0)
+                    total_repairs += int(r.get("repair_attempts") or 0)
+                    total_loop_warns += int(r.get("loop_warnings") or 0)
+                    for k, v in (r.get("tool_histogram") or {}).items():
+                        tool_hist[k] = tool_hist.get(k, 0) + int(v or 0)
+                self._send_json(
+                    200,
+                    {
+                        "version": APP_VERSION,
+                        "exported_at": time.time(),
+                        "run": redacted,
+                        "board_messages": board_msgs,
+                        "leases": leases,
+                        "summary_metrics": {
+                            "total_turns": total_turns,
+                            "total_tool_calls": total_tools,
+                            "total_repairs": total_repairs,
+                            "loop_warnings": total_loop_warns,
+                            "tool_histogram": tool_hist,
+                            "metering": redacted.get("metering") or {},
+                        },
+                    },
+                )
                 return
             if path.startswith("/api/runs/"):
                 run_id = path[len("/api/runs/") :].strip("/")

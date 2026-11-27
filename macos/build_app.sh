@@ -34,7 +34,8 @@ cp "$SWARM_DIR/agent_loop.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/research_loop.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/device_mesh.py" "$BUNDLE_SWARM/"
 cp "$SWARM_DIR/swarm_node.py" "$BUNDLE_SWARM/"
-chmod +x "$BUNDLE_SWARM/desktop_server.py"
+cp "$SWARM_DIR/open_swarm_cli.py" "$BUNDLE_SWARM/"
+chmod +x "$BUNDLE_SWARM/desktop_server.py" "$BUNDLE_SWARM/open_swarm_cli.py"
 
 cat > "$CONTENTS/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -56,9 +57,9 @@ cat > "$CONTENTS/Info.plist" << 'PLIST'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.4.0</string>
+  <string>0.5.0</string>
   <key>CFBundleVersion</key>
-  <string>4</string>
+  <string>5</string>
   <key>LSMinimumSystemVersion</key>
   <string>13.0</string>
   <key>NSHighResolutionCapable</key>

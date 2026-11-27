@@ -1898,7 +1898,25 @@ def _tool_status_label(content: str) -> str:
     return "err" if '"ok": false' in content.lower() or "error" in content.lower() else "ok"
 
 
+def _is_important_middle_message(msg: dict[str, Any]) -> bool:
+    """Keep explicit continuity notes, contracts, or loop warnings intact during compaction."""
+    content = str(msg.get("content") or "")
+    role = msg.get("role")
+    if "LOOP_DETECTED:" in content or "[CONTRACT]" in content or "NEED_DECISION" in content:
+        return True
+    if role == "tool" and msg.get("name") in ("write_note", "post_board"):
+        return True
+    if role == "assistant" and isinstance(msg.get("tool_calls"), list):
+        for tc in msg["tool_calls"]:
+            fn = tc.get("function") or {}
+            if fn.get("name") in ("write_note", "post_board"):
+                return True
+    return False
+
+
 def _compact_middle_message(msg: dict[str, Any]) -> dict[str, Any]:
+    if _is_important_middle_message(msg):
+        return dict(msg)
     role = msg.get("role")
     content = str(msg.get("content") or "")
 
@@ -2039,6 +2057,9 @@ def run_agent_loop(
 
     turns = 0
     tool_calls_count = 0
+    tool_histogram: dict[str, int] = {}
+    recent_call_sigs: list[str] = []
+    loop_warnings = 0
     prompt_tokens = 0
     cached_tokens = 0
     completion_tokens = 0
@@ -2142,14 +2163,31 @@ def run_agent_loop(
                     tname = str(fn.get("name") or "")
                     targs = fn.get("arguments")
                     tool_calls_count += 1
+                    tool_histogram[tname] = tool_histogram.get(tname, 0) + 1
+                    try:
+                        args_canon = json.dumps(targs, sort_keys=True) if isinstance(targs, dict) else str(targs)
+                    except TypeError:
+                        args_canon = str(targs)
+                    sig = f"{tname}:{args_canon}"
+                    recent_call_sigs.append(sig)
                     _emit(f"Tool: {tname}")
                     result = toolkit.dispatch(tname, targs)
+                    loop_nudge = ""
+                    if recent_call_sigs.count(sig) >= 3 and not recent_call_sigs[-1].startswith("finish:"):
+                        loop_warnings += 1
+                        loop_nudge = (
+                            f"\nLOOP_DETECTED: You repeated `{tname}` with identical arguments {recent_call_sigs.count(sig)} times. "
+                            "Step back, inspect `git_diff` or `read_file`, try a different fix, or call `post_board(kind='NEED_DECISION', ...)`."
+                        )
+                    payload_out = dict(result)
+                    if loop_nudge:
+                        payload_out["loop_warning"] = loop_nudge.strip()
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc_id,
                             "name": tname,
-                            "content": json.dumps(result),
+                            "content": json.dumps(payload_out),
                         }
                     )
                     if toolkit.finished:
@@ -2167,10 +2205,24 @@ def run_agent_loop(
                 result_sections: list[str] = []
                 for tname, targs in fenced_calls:
                     tool_calls_count += 1
+                    tool_histogram[tname] = tool_histogram.get(tname, 0) + 1
+                    try:
+                        args_canon = json.dumps(targs, sort_keys=True) if isinstance(targs, dict) else str(targs)
+                    except TypeError:
+                        args_canon = str(targs)
+                    sig = f"{tname}:{args_canon}"
+                    recent_call_sigs.append(sig)
                     _emit(f"Tool: {tname}")
                     result = toolkit.dispatch(tname, targs)
+                    payload_out = dict(result)
+                    if recent_call_sigs.count(sig) >= 3 and tname != "finish":
+                        loop_warnings += 1
+                        payload_out["loop_warning"] = (
+                            f"LOOP_DETECTED: You repeated `{tname}` {recent_call_sigs.count(sig)} times. "
+                            "Inspect `git_diff`/`read_file` or try another approach."
+                        )
                     result_sections.append(
-                        f"Tool `{tname}` result:\n```json\n{json.dumps(result)}\n```"
+                        f"Tool `{tname}` result:\n```json\n{json.dumps(payload_out)}\n```"
                     )
                     if toolkit.finished:
                         break
@@ -2237,6 +2289,8 @@ def run_agent_loop(
         "summary": scrub_secrets(summary),
         "turns": turns,
         "tool_calls": tool_calls_count,
+        "tool_histogram": tool_histogram,
+        "loop_warnings": loop_warnings,
         "written_files": list(toolkit.written_files),
         "readonly_violations": list(toolkit.readonly_violations),
         "notes_path": toolkit.notes_path,

@@ -10,16 +10,15 @@ An Apple-clean, agent-first native macOS desktop app and zero-dependency Python 
 
 ---
 
-## Highlights (`v0.4.0`)
+## Highlights (`v0.5.0`)
 
-- **Zero-dependency Python stdlib engine** (no pip bloat) + lightweight native macOS Swift/WebKit shell (`Open Swarm.app`)
+- **Zero-dependency Python stdlib engine** (no pip bloat) + lightweight native macOS Swift/WebKit shell (`Open Swarm.app`) + unified CLI (`open-swarm doctor`, `bench`, `board`, `devices`, `run`, `serve`)
 - **Swarm Message Board & Atomic File Leases** — live coordinator-hosted SQLite/SSE message board (`CLAIM_FILE`, `CONTRACT`, `FINDING`, `QUESTION`, `NEED_DECISION`, `BLOCKED`, `DONE`, `DECISION`), per-agent cursors, atomic file-ownership leases, and human decision replies in UI
-- **Hardened Multi-Turn Agent Tool Loop (M1)** — OS-sandboxed `run_command` (macOS Seatbelt `sandbox-exec` / Linux `bwrap`), automatic regex secret scrubbing, `list_dir`, `git_diff`, surgical `edit_file` with closest-match line hints, instant syntax diagnostics (`py_compile` / `json` / `node --check`), background PTY/tmux command handles, `write_note`, and shared board/lease tools
-- **DAG Wave Orchestrator & Tool-Enabled Critic Gate** — dependency-ordered execution waves (`depends_on` / contract-first phases), read-only critic inspection across untouched callers/tests, test-quality rubric, automated critic-repair loop, `Cross-Vendor Verified` vs `Same-Vendor Fresh` badges, and **Post-Merge Integration Test Gate** before touching `main`
-- **Security Hardening** — `Host`/`Origin`/`X-OpenSwarm-CSRF` loopback protection, scoped ephemeral coordinator LLM proxy tokens so remote workers never receive raw upstream keys, and forced `core.hooksPath=/dev/null` on all git worktree/bundle operations
-- **Verified Devices & Live Compute Mesh (Tailscale)** — live `gpu_util_pct` / VRAM / free-RAM telemetry, busy-GPU routing guard, async remote jobs with SSE log streaming, incremental bare-repo mirror delta sync, and 6-digit PIN + SHA-256 fingerprint pinning
-- **Karpathy Autoresearch Swarm (M2)** — multi-island git worktree evolution with `.open_swarm/{program.md,results.tsv,findings.md}`, **strictly isolated `eval_cmd` vs untimed `health_cmd` unit tests**, SHA-256 tamper protection, monotonic git ratchet, and live SVG Score Sparkline
-- **BYO OpenAI-Compatible Backend** — OutrCore Cloud (`https://api.outrcore.com/v1`), local `k5cuda` / `vLLM` / `Ollama`, or custom `~/.open_swarm/presets.json` / `OPEN_SWARM_BACKEND_URL`
+- **Hardened Multi-Turn Agent Tool Loop (M1)** — OS-sandboxed `run_command` (macOS Seatbelt `sandbox-exec` / Linux `bwrap`), automatic regex secret scrubbing, stuck-agent loop detection + recovery nudges, importance-preserving context compaction, `list_dir`, `git_diff`, surgical `edit_file` with closest-match line hints, instant syntax diagnostics (`py_compile` / `json` / `node --check`), background PTY/tmux command handles, `write_note`, and shared board/lease tools
+- **Redacted Run Trace Export & Replay Metrics** — export any run (`GET /api/runs/<id>/export` or UI **Export Trace**) with secret-scrubbed tool histograms, turns, repair rounds, board history, and metering
+- **DAG Wave Orchestrator & Tool-Enabled Critic Gate** — dependency-ordered execution waves (`depends_on` / contract-first phases), read-only critic inspection across untouched callers/tests, test-quality rubric, automated repair loop, `Cross-Vendor Verified` vs `Same-Vendor Fresh` badges, and fail-closed **Post-Merge Integration Test Gate** before touching `main`
+- **Security & Live Compute Mesh (Tailscale)** — loopback Host/Origin/CSRF protection, scoped ephemeral coordinator LLM proxy tokens, forced `core.hooksPath=/dev/null`, live GPU%/VRAM/RAM routing guards, async SSE remote jobs, and incremental bare-repo mirror sync
+- **Karpathy Autoresearch Swarm (M2)** & **BYO OpenAI-Compatible Backend** — OutrCore Cloud (`https://api.outrcore.com/v1`), local `k5cuda` / `vLLM` / `Ollama`, or custom presets
 
 ---
 

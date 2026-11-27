@@ -1183,6 +1183,65 @@ class Phase2BSwarmRunTests(unittest.TestCase):
             self.assertTrue(any(m["kind"] == "CLAIM_FILE" and "app.py" in m["body"] for m in bmsgs))
             self.assertTrue(any(m["kind"] == "FINDING" and "updated X" in m["body"] for m in bmsgs))
 
+    def test_loop_detection_nudge_and_important_compaction_v050(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(repo), capture_output=True, check=True)
+            (repo / "app.py").write_text("X = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "add app"], cwd=str(repo), capture_output=True, check=True)
+
+            script = [
+                {"tool_calls": [{"id": "l1", "type": "function", "function": {"name": "read_file", "arguments": {"path": "app.py"}}}]},
+                {"tool_calls": [{"id": "l2", "type": "function", "function": {"name": "read_file", "arguments": {"path": "app.py"}}}]},
+                {"tool_calls": [{"id": "l3", "type": "function", "function": {"name": "read_file", "arguments": {"path": "app.py"}}}]},
+                {"tool_calls": [{"id": "l4", "type": "function", "function": {"name": "finish", "arguments": {"summary": "recovered"}}}]},
+            ]
+            seen_msgs = []
+
+            def _handler(idx, body):
+                seen_msgs.append(body.get("messages") or [])
+                return script[idx]
+
+            with MockOpenAIServer(_handler) as srv:
+                res = run_agent_loop(
+                    worktree=repo,
+                    system_prompt="SYS",
+                    user_prompt="Check app.py",
+                    base_url=srv.url,
+                    api_key="k",
+                    model="m",
+                    max_turns=6,
+                )
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["loop_warnings"], 1)
+            self.assertEqual(res["tool_histogram"].get("read_file"), 3)
+            # Turn 4 messages contain LOOP_DETECTED warning in tool response
+            last_turn_txt = json.dumps(seen_msgs[-1])
+            self.assertIn("LOOP_DETECTED", last_turn_txt)
+
+            # Importance-aware compaction retains [CONTRACT] / write_note middle turns
+            from agent_loop import _compact_messages_if_needed
+
+            long_pad = "Z" * 500
+            msgs = [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "TASK"},
+                {"role": "tool", "name": "read_file", "content": long_pad},
+                {"role": "tool", "name": "post_board", "content": "[CONTRACT] keep API v2"},
+                {"role": "assistant", "content": "working " + long_pad},
+                {"role": "user", "content": "tail1"},
+                {"role": "assistant", "content": "tail2"},
+                {"role": "user", "content": "tail3"},
+                {"role": "assistant", "content": "tail4"},
+            ]
+            compacted = _compact_messages_if_needed(msgs, compact_threshold_chars=300)
+            self.assertEqual(compacted[3]["content"], "[CONTRACT] keep API v2")
+            self.assertIn("Compacted tool output: read_file", compacted[2]["content"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

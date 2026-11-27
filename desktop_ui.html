@@ -1187,6 +1187,7 @@ function renderRun(rec) {
               ? `<button class="primary" onclick="applyOne('${rec.run_id}','${winnerId}')">Apply Winner</button>`
               : `<button class="primary" onclick="applyAll('${rec.run_id}')" ${unappliedPassed ? "" : "disabled"}>${unappliedPassed ? `Apply All Verified (${unappliedPassed})` : "All Verified Applied"}</button>`)}
         <button onclick="openPreview()">Preview</button>
+        <button onclick="exportRunTrace('${rec.run_id}')">Export Trace</button>
         <button class="ghost" onclick="showDetails=!showDetails;renderRun(window._lastRun)">Inspect Details ${showDetails ? "▴" : "▾"}</button>
       </div>
     ` : ""}
@@ -1202,6 +1203,8 @@ function renderRun(rec) {
             ${a.review ? `<span class="badge ${a.review.verdict === 'approve' ? 'ok' : (a.review.verdict === 'block' ? 'fail' : 'warn')}">Critic: ${escapeHtml(a.review.verdict)}</span>` : ""}
             ${a.review ? `<span class="badge ${(a.review.eligibility && a.review.eligibility.cross_vendor) ? 'ok' : 'warn'}">${(a.review.eligibility && a.review.eligibility.cross_vendor) ? 'Cross-Vendor Verified' : 'Same-Vendor Fresh'}</span>` : ""}
             ${a.review && a.review.test_quality ? `<span class="badge ${a.review.test_quality === 'weak' ? 'warn' : 'ok'}">Tests: ${escapeHtml(a.review.test_quality)}</span>` : ""}
+            ${a.turns ? `<span class="badge">${a.turns} turns · ${a.tool_calls || 0} tools</span>` : ""}
+            ${a.loop_warnings ? `<span class="badge warn">${a.loop_warnings} loop nudge</span>` : ""}
             ${a.tok_s != null ? `<span class="badge">${a.completion_tokens || 0} tok · ${a.tok_s} t/s</span>` : ""}
             ${applied.has(a.agent_id) ? `<span class="badge ok">Applied</span>` : ""}
             <div class="spacer"></div>
@@ -1217,6 +1220,24 @@ function renderRun(rec) {
     </div>
   `;
   window._lastRun = rec;
+}
+
+async function exportRunTrace(runId) {
+  try {
+    const trace = await api(`/api/runs/${encodeURIComponent(runId)}/export`);
+    const blob = new Blob([JSON.stringify(trace, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${runId}.trace.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast(`Exported trace (${trace.summary_metrics.total_tool_calls || 0} tool calls).`);
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 
 async function applyAll(runId, force = false) {

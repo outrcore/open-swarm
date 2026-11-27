@@ -625,6 +625,8 @@ def run_swarm(
                 )
                 res_info["turns"] = int(loop_res.get("turns") or 0)
                 res_info["tool_calls"] = int(loop_res.get("tool_calls") or 0)
+                res_info["tool_histogram"] = dict(loop_res.get("tool_histogram") or {})
+                res_info["loop_warnings"] = int(loop_res.get("loop_warnings") or 0)
                 res_info["notes_path"] = loop_res.get("notes_path")
                 res_info["completion_tokens"] += int(loop_res.get("completion_tokens") or 0)
                 res_info["prompt_tokens"] += int(loop_res.get("prompt_tokens") or 0)
@@ -746,13 +748,20 @@ def run_swarm(
     try:
         has_dag = any(t.get("depends_on") or t.get("phase") for t in tasks)
         waves = plan_task_dag(tasks) if has_dag else [tasks]
-        idx_by_obj = {id(t): i for i, t in enumerate(tasks)}
-        for wave in waves:
+        idx_by_id = {str(t.get("id") or f"t{i}"): i for i, t in enumerate(tasks)}
+        for wave_num, wave in enumerate(waves):
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
                 break
             with ThreadPoolExecutor(max_workers=max(1, len(wave))) as pool:
-                futs = [pool.submit(worker, idx_by_obj[id(t)], t) for t in wave]
+                futs = [
+                    pool.submit(
+                        worker,
+                        idx_by_id.get(str(t.get("id") or ""), wave_num),
+                        t,
+                    )
+                    for t in wave
+                ]
                 for f in as_completed(futs):
                     agent_results.append(f.result())
         agent_results.sort(key=lambda r: r["agent_id"])
