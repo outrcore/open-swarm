@@ -22,12 +22,16 @@ if str(_REPO_ROOT) not in sys.path:
 from open_swarm.continuity_store import compute_file_hashes  # noqa: E402
 from open_swarm.device_mesh import (  # noqa: E402
     DeviceRegistry,
+    cancel_remote_job,
     discover_tailscale_peers,
     execute_task_on_remote_device,
     find_tailscale_bin,
+    get_remote_job_status,
     infer_required_capabilities,
     probe_local_device,
     route_tasks_to_devices,
+    stream_remote_job_events,
+    submit_async_remote_job,
 )
 
 
@@ -437,6 +441,327 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(dev["online"])
         self.assertEqual(dev["host"], "127.0.0.1")
         self.assertEqual(dev["port"], 18790)
+        self.assertIn("telemetry", dev)
+        self.assertIsInstance(dev["mem_avail_gb"], float)
+        self.assertIn("gpu_util_pct", dev)
+        self.assertIn("cpu_load_pct", dev)
+
+
+class Phase2DDeviceMeshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name)
+        self.devices_path = self.root / "devices.json"
+        self.registry = DeviceRegistry(path=self.devices_path)
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_busy_gpu_and_low_mem_routing_guards(self) -> None:
+        local_dev = {
+            "device_id": "local",
+            "name": "This Mac",
+            "is_local": True,
+            "online": True,
+            "tampered": False,
+            "capabilities": ["python", "git", "macos", "swift"],
+            "gpu": "Apple Silicon GPU",
+            "gpu_util_pct": None,
+            "mem_avail_gb": 16.0,
+            "active_agents": 0,
+            "max_agents": 4,
+            "inference_url": None,
+        }
+        spark_busy = {
+            "device_id": "spark-busy",
+            "name": "Spark Busy",
+            "is_local": False,
+            "online": True,
+            "tampered": False,
+            "capabilities": ["python", "git", "linux", "cuda", "gpu"],
+            "gpu": "NVIDIA GB10",
+            "gpu_util_pct": 89.0,
+            "mem_avail_gb": 64.0,
+            "active_agents": 0,
+            "max_agents": 8,
+            "inference_url": "http://100.64.0.21:8000/v1",
+        }
+        spark_idle = {
+            "device_id": "spark-idle",
+            "name": "Spark Idle",
+            "is_local": False,
+            "online": True,
+            "tampered": False,
+            "capabilities": ["python", "git", "linux", "cuda", "gpu"],
+            "gpu": "NVIDIA GB10",
+            "gpu_util_pct": 12.0,
+            "mem_avail_gb": 64.0,
+            "active_agents": 0,
+            "max_agents": 8,
+            "inference_url": "http://100.64.0.22:8000/v1",
+        }
+        cuda_task = [
+            {
+                "id": "T-GPU-1",
+                "title": "Train CUDA kernel",
+                "spec": "Benchmark torch.compile CUDA throughput",
+                "acceptance_cmd": "pytest",
+            }
+        ]
+
+        # 1. Busy Spark skipped in favor of idle Spark, using (tasks, local, remote_devices=...) form
+        routed = route_tasks_to_devices(
+            cuda_task,
+            local_dev,
+            remote_devices=[spark_busy, spark_idle],
+            max_gpu_util_pct=75.0,
+            min_mem_avail_gb=2.0,
+        )
+        self.assertEqual(routed[0]["device_id"], "spark-idle")
+        self.assertIn(
+            {"device_id": "spark-busy", "reason": "skipped_busy_gpu"},
+            routed[0]["routing_notes"],
+        )
+
+        # 2. Only busy Spark available -> fallback to local with skipped_busy_gpu note
+        routed_fb = route_tasks_to_devices(
+            cuda_task,
+            [local_dev, spark_busy],
+            max_gpu_util_pct=75.0,
+        )
+        self.assertEqual(routed_fb[0]["device_id"], "local")
+        self.assertEqual(routed_fb[0]["reason"], "fallback_no_capable_device")
+        self.assertIn(
+            {"device_id": "spark-busy", "reason": "skipped_busy_gpu"},
+            routed_fb[0]["routing_notes"],
+        )
+
+        # 3. Low-memory device skipped for general tasks too
+        low_mem_spark = dict(spark_idle, device_id="spark-lowmem", mem_avail_gb=0.9)
+        py_task = [
+            {"id": "T-PY-1", "title": "Clean utils", "spec": "Refactor python helpers", "acceptance_cmd": "pytest"}
+        ]
+        routed_mem = route_tasks_to_devices(
+            py_task,
+            [local_dev, low_mem_spark],
+            min_mem_avail_gb=2.0,
+        )
+        self.assertEqual(routed_mem[0]["device_id"], "local")
+        self.assertIn(
+            {"device_id": "spark-lowmem", "reason": "skipped_low_mem"},
+            routed_mem[0]["routing_notes"],
+        )
+
+    def test_remote_telemetry_proxy_forwarding_mirror_fallback_and_async_sse(self) -> None:
+        state = {
+            "exec_payloads": [],
+            "job_payloads": [],
+            "mirror_misses_left": 1,
+            "cancelled": False,
+        }
+
+        class _Handler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def _send_json(self, code: int, body: dict) -> None:
+                raw = json.dumps(body).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self) -> None:
+                if self.path == "/node/health":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "version": "0.4.0",
+                            "fingerprint": "fp-2d",
+                            "capabilities": ["linux", "cuda", "gpu", "python"],
+                            "gpu": "NVIDIA GB10",
+                            "active_agents": 1,
+                            "max_agents": 8,
+                            "inference_url": "http://100.64.0.20:8000/v1",
+                            "telemetry": {
+                                "gpu_util_pct": 22.5,
+                                "gpu_mem_used_mb": 1024,
+                                "gpu_mem_total_mb": 24576,
+                                "mem_avail_gb": 96.4,
+                                "cpu_load_pct": 18.0,
+                            },
+                            "gpu_util_pct": 22.5,
+                            "gpu_mem_used_mb": 1024,
+                            "gpu_mem_total_mb": 24576,
+                            "mem_avail_gb": 96.4,
+                            "cpu_load_pct": 18.0,
+                        },
+                    )
+                    return
+
+                if self.path == "/node/jobs/job_123":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "job_id": "job_123",
+                            "status": "cancelled" if state["cancelled"] else "completed",
+                            "events": [{"seq": 1, "event": "queued", "data": {"status": "queued"}}],
+                            "result": {"tests_ok": True, "written_files": ["app.py"], "diff": ""},
+                            "error": None,
+                            "fingerprint": "fp-2d",
+                        },
+                    )
+                    return
+
+                if self.path == "/node/jobs/job_123/stream":
+                    self.close_connection = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    chunks = (
+                        b"id: 1\nevent: queued\ndata: {\"seq\": 1, \"event\": \"queued\"}\n\n"
+                        b"id: 2\nevent: progress\ndata: {\"seq\": 2, \"event\": \"progress\", \"data\": {\"stage\": \"coding\"}}\n\n"
+                        b"event: done\ndata: {\"job_id\": \"job_123\", \"status\": \"completed\"}\n\n"
+                    )
+                    self.wfile.write(chunks)
+                    self.wfile.flush()
+                    return
+
+                self._send_json(404, {"error": "not found"})
+
+            def do_POST(self) -> None:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+                if self.path == "/node/pair":
+                    self._send_json(
+                        200,
+                        {
+                            "node_id": "spark-2d",
+                            "name": "Spark 2D",
+                            "device_token": "tok-2d",
+                            "fingerprint": "fp-2d",
+                            "capabilities": ["linux", "cuda", "gpu", "python"],
+                        },
+                    )
+                    return
+                if self.path == "/node/exec":
+                    state["exec_payloads"].append(body)
+                    if body.get("incremental") and state["mirror_misses_left"] > 0:
+                        state["mirror_misses_left"] -= 1
+                        self._send_json(409, {"ok": False, "mirror_miss": True, "error": "Mirror cache miss"})
+                        return
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "fingerprint": "fp-2d",
+                            "result": {"written_files": ["app.py"], "tests_ok": True, "diff": ""},
+                        },
+                    )
+                    return
+                if self.path == "/node/jobs":
+                    state["job_payloads"].append(body)
+                    self._send_json(202, {"ok": True, "job_id": "job_123", "status": "queued"})
+                    return
+                if self.path == "/node/jobs/job_123/cancel":
+                    state["cancelled"] = True
+                    self._send_json(200, {"ok": True, "job_id": "job_123", "status": "cancelled"})
+                    return
+                self._send_json(404, {"error": "not found"})
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        port = srv.server_address[1]
+        thr = threading.Thread(target=srv.serve_forever, daemon=True)
+        thr.start()
+        try:
+            self.registry.pair_device(host="127.0.0.1", port=port, pair_code="PAIR-OK")
+            devices = self.registry.list_devices(probe=True)
+            spark = next(d for d in devices if d["device_id"] == "spark-2d")
+            self.assertEqual(spark["version"], "0.4.0")
+            self.assertEqual(spark["gpu_util_pct"], 22.5)
+            self.assertEqual(spark["gpu_mem_used_mb"], 1024)
+            self.assertEqual(spark["gpu_mem_total_mb"], 24576)
+            self.assertEqual(spark["mem_avail_gb"], 96.4)
+            self.assertEqual(spark["cpu_load_pct"], 18.0)
+
+            repo = self.root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(repo), check=True)
+            subprocess.run(["git", "config", "user.name", "T"], cwd=str(repo), check=True)
+            (repo / "app.py").write_text("print(1)\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "c1"], cwd=str(repo), check=True, capture_output=True)
+            c1 = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=str(repo), check=True, capture_output=True, text=True
+            ).stdout.strip()
+            (repo / "app.py").write_text("print(2)\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(repo), check=True)
+            subprocess.run(["git", "commit", "-m", "c2"], cwd=str(repo), check=True, capture_output=True)
+
+            creds = self.registry.get_device_credentials("spark-2d")
+            assert creds is not None
+
+            # Scoped LLM proxy + incremental fallback on 409 mirror_miss
+            execute_task_on_remote_device(
+                repo=repo,
+                device_creds=creds,
+                task={"id": "T-1", "spec": "Do", "acceptance_cmd": "pytest"},
+                base_url="https://api.upstream.example/v1",
+                model="coder",
+                api_key="sk-raw-upstream-secret",
+                llm_proxy_url="http://100.64.0.1:18790/v1",
+                llm_proxy_token="scoped-proxy-tok",
+                repo_key="test/repo",
+                incremental=True,
+                since_commit=c1,
+            )
+            self.assertEqual(len(state["exec_payloads"]), 2)
+            self.assertTrue(state["exec_payloads"][0]["incremental"])
+            self.assertFalse(state["exec_payloads"][1]["incremental"])
+            for p in state["exec_payloads"]:
+                self.assertEqual(p["llm_proxy_url"], "http://100.64.0.1:18790/v1")
+                self.assertEqual(p["llm_proxy_token"], "scoped-proxy-tok")
+                self.assertNotIn("api_key", p)
+
+            # Async submit + SSE stream + status + cancel
+            sub = submit_async_remote_job(
+                repo=repo,
+                device_creds=creds,
+                task={"id": "T-2", "spec": "Do", "acceptance_cmd": "pytest"},
+                base_url="http://127.0.0.1:8000/v1",
+                model="coder",
+                api_key="sk-raw-upstream-secret",
+                llm_proxy_url="http://100.64.0.1:18790/v1",
+                llm_proxy_token="scoped-job-tok",
+            )
+            self.assertEqual(sub["job_id"], "job_123")
+            self.assertEqual(sub["status"], "queued")
+            self.assertNotIn("api_key", state["job_payloads"][0])
+            self.assertEqual(state["job_payloads"][0]["llm_proxy_token"], "scoped-job-tok")
+
+            seen: list[str] = []
+            events = stream_remote_job_events(
+                device_creds=creds,
+                job_id="job_123",
+                on_event=lambda ev: seen.append(ev["event"]),
+            )
+            self.assertEqual(seen, ["queued", "progress", "done"])
+            self.assertEqual(events[-1]["data"]["status"], "completed")
+
+            st = get_remote_job_status(device_creds=creds, job_id="job_123")
+            self.assertEqual(st["status"], "completed")
+
+            can = cancel_remote_job(device_creds=creds, job_id="job_123")
+            self.assertEqual(can["status"], "cancelled")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

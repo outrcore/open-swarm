@@ -500,6 +500,14 @@ let pollTimer = null;
 let chatHistory = [];
 let chatAbort = null;
 let selfBuildPath = "";
+let csrfToken = "";
+let boardCache = { messages: [], leases: [] };
+
+function getCsrfToken() {
+  if (csrfToken) return csrfToken;
+  const meta = document.querySelector('meta[name="open-swarm-csrf"]');
+  return meta ? (meta.getAttribute("content") || "") : "";
+}
 
 const STAGE_LABEL = {
   queued: "Queued",
@@ -532,7 +540,13 @@ function showToast(msg, isErr = false) {
 function hideToast() { document.getElementById("toast").className = "toast"; }
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, opts);
+  const method = String(opts.method || "GET").toUpperCase();
+  const hdrs = Object.assign({}, opts.headers || {});
+  const tok = getCsrfToken();
+  if (method !== "GET" && method !== "HEAD" && tok && !hdrs["X-OpenSwarm-CSRF"]) {
+    hdrs["X-OpenSwarm-CSRF"] = tok;
+  }
+  const res = await fetch(path, Object.assign({}, opts, { headers: hdrs }));
   const data = await res.json();
   if (!res.ok) {
     const err = new Error(data.error || `HTTP ${res.status}`);
@@ -567,6 +581,8 @@ async function refreshDevices() {
       const gpuTxt = d.gpu && d.gpu.name ? d.gpu.name : (d.capabilities && d.capabilities.includes("swift") ? "Apple Silicon" : (d.os || ""));
       const stCls = d.tampered ? "fail" : (d.online ? "ok" : "warn");
       const stTxt = d.tampered ? "Tampered" : (d.online ? "Online" : "Offline");
+      const utilPill = d.gpu_util_pct != null ? `<span class="badge ${d.gpu_util_pct >= 75 ? 'warn' : 'ok'}">GPU ${Math.round(d.gpu_util_pct)}%</span>` : "";
+      const memPill = d.mem_avail_gb != null ? `<span class="badge">${d.mem_avail_gb}G free</span>` : "";
       return `
         <div style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--surface-2);border-radius:10px;border:1px solid var(--border);">
           <span class="dot ${d.online && !d.tampered ? 'ok' : 'err'}"></span>
@@ -574,6 +590,7 @@ async function refreshDevices() {
             <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(d.name || d.device_id)}</div>
             <div style="font-size:11px;color:var(--muted);">${escapeHtml(gpuTxt)}${d.inference_url ? " · Local LLM" : ""}</div>
           </div>
+          ${utilPill}${memPill}
           <span class="badge ${stCls}">${stTxt}</span>
           ${!d.is_local ? `<button class="ghost danger-txt" style="padding:1px 6px;" onclick="removeDevice('${escapeHtml(d.device_id)}')">×</button>` : ""}
         </div>`;
@@ -891,7 +908,11 @@ function startPolling() {
   pollTimer = setInterval(async () => {
     if (!activeRunId) return;
     try {
-      const rec = await api(`/api/runs/${activeRunId}`);
+      const [rec, bdata] = await Promise.all([
+        api(`/api/runs/${activeRunId}`),
+        api(`/api/board/messages?run_id=${encodeURIComponent(activeRunId)}`).catch(() => ({ messages: [], leases: [] }))
+      ]);
+      boardCache = { messages: bdata.messages || [], leases: bdata.leases || [] };
       renderRun(rec);
       await refreshRuns();
       if (rec.status !== "running") {
@@ -899,12 +920,65 @@ function startPolling() {
         pollTimer = null;
         if (rec.status === "completed") {
           showToast(`${rec.passed_count}/${rec.agents_count} verified · $${Number((rec.metering || {}).cost_usd || 0).toFixed(4)}`);
+        } else if (rec.status === "cancelled") {
+          showToast("Run cancelled.", true);
         } else if (rec.error) {
           showToast(rec.error, true);
         }
       }
     } catch (_) {}
   }, 1000);
+}
+
+async function cancelRun(runId) {
+  try {
+    await api(`/api/runs/${runId}/cancel`, { method: "POST", headers: {"Content-Type": "application/json"}, body: "{}" });
+    const rec = await api(`/api/runs/${runId}`);
+    renderRun(rec);
+    showToast("Cancellation requested.");
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function resolveBoardDecision(seq) {
+  const inp = document.getElementById(`decInput-${seq}`);
+  const val = inp ? inp.value.trim() : "";
+  if (!val) return showToast("Enter a decision reply first.", true);
+  try {
+    await api("/api/board/resolve", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ seq, resolution: val, resolver: "human" })
+    });
+    if (activeRunId) {
+      const bdata = await api(`/api/board/messages?run_id=${encodeURIComponent(activeRunId)}`);
+      boardCache = { messages: bdata.messages || [], leases: bdata.leases || [] };
+      if (window._lastRun) renderRun(window._lastRun);
+    }
+    showToast("Decision posted to Swarm Board.");
+  } catch (err) {
+    showToast(err.message, true);
+  }
+}
+
+async function postHumanBoardNote(runId) {
+  const inp = document.getElementById("humanBoardInput");
+  const body = inp ? inp.value.trim() : "";
+  if (!body) return;
+  try {
+    await api("/api/board/post", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ run_id: runId, from_agent: "human", kind: "FINDING", body, to_agent: "all" })
+    });
+    inp.value = "";
+    const bdata = await api(`/api/board/messages?run_id=${encodeURIComponent(runId)}`);
+    boardCache = { messages: bdata.messages || [], leases: bdata.leases || [] };
+    if (window._lastRun) renderRun(window._lastRun);
+  } catch (err) {
+    showToast(err.message, true);
+  }
 }
 
 function formatDiff(diff) {
@@ -1028,14 +1102,55 @@ function renderRun(rec) {
       </div>`;
   })() : "";
 
+  const boardHtml = (() => {
+    const bMsgs = boardCache.messages || [];
+    const bLeases = boardCache.leases || [];
+    if (!bMsgs.length && !bLeases.length && rec.status !== "running") return "";
+    const leaseChips = bLeases.map(l => `<span class="badge">${escapeHtml(l.rel_path)} → ${escapeHtml(l.owner_agent)}</span>`).join(" ");
+    const msgRows = bMsgs.slice(-12).map(m => {
+      const isNeedDec = m.kind === "NEED_DECISION" && !m.resolved;
+      return `
+        <div style="padding:6px 8px;border-radius:9px;background:var(--surface-2);border:1px solid var(--border);margin-bottom:6px;font-size:12px;">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <span class="badge ${m.kind === 'BLOCKED' || m.kind === 'NEED_DECISION' ? 'warn' : (m.kind === 'DONE' || m.kind === 'DECISION' ? 'ok' : '')}">${escapeHtml(m.kind)}</span>
+            <b>${escapeHtml(m.from_agent)}</b>
+            <span style="color:var(--muted);">→ ${escapeHtml(m.to_agent)}</span>
+            <span style="color:var(--muted);margin-left:auto;font-family:var(--mono);">#${m.seq}</span>
+          </div>
+          <div style="margin-top:4px;white-space:pre-wrap;">${escapeHtml(m.body)}</div>
+          ${m.resolved ? `<div style="margin-top:3px;color:var(--green);font-size:11.5px;">Resolved: ${escapeHtml(m.resolution)}</div>` : ""}
+          ${isNeedDec ? `
+            <div style="display:flex;gap:6px;margin-top:6px;">
+              <input id="decInput-${m.seq}" placeholder="Reply with human decision…" style="flex:1;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:4px 8px;font-size:12px;" />
+              <button class="primary" onclick="resolveBoardDecision(${m.seq})">Resolve</button>
+            </div>` : ""}
+        </div>`;
+    }).join("");
+    return `
+      <div class="detail-card" style="margin-top:12px;">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+          <b style="font-size:12.5px;">Swarm Message Board</b>
+          <span class="badge">${bMsgs.length} msg</span>
+          <span class="badge">${bLeases.length} lease(s)</span>
+        </div>
+        ${leaseChips ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;">${leaseChips}</div>` : ""}
+        ${msgRows || `<div style="font-size:12px;color:var(--muted);margin-bottom:6px;">Waiting for agent board events…</div>`}
+        <div style="display:flex;gap:6px;margin-top:6px;">
+          <input id="humanBoardInput" placeholder="Post guidance to swarm agents…" style="flex:1;background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:5px 9px;font-size:12px;" />
+          <button onclick="postHumanBoardNote('${escapeHtml(rec.run_id)}')">Post</button>
+        </div>
+      </div>`;
+  })();
+
   stageEl.innerHTML = `
     <div class="hub-card">
-      <span class="dot ${rec.status === 'completed' ? 'ok' : (rec.status === 'error' ? 'err' : 'live')}"></span>
+      <span class="dot ${rec.status === 'completed' ? 'ok' : (rec.status === 'error' || rec.status === 'cancelled' ? 'err' : 'live')}"></span>
       <div style="min-width:0;flex:1;">
         <div class="hub-title">${escapeHtml(rec.goal || rec.run_id)}</div>
         <div class="hub-sub">${escapeHtml(hubSub)}</div>
       </div>
-      <span class="badge ${rec.status === 'completed' ? 'ok' : (rec.status === 'error' ? 'fail' : 'live')}">${escapeHtml(rec.status)}</span>
+      ${rec.status === 'running' ? `<button class="ghost danger-txt" style="padding:3px 9px;" onclick="cancelRun('${escapeHtml(rec.run_id)}')">Cancel</button>` : ""}
+      <span class="badge ${rec.status === 'completed' ? 'ok' : (rec.status === 'error' || rec.status === 'cancelled' ? 'fail' : 'live')}">${escapeHtml(rec.status)}</span>
     </div>
     ${svg}
     <div class="nodes-grid">
@@ -1062,6 +1177,7 @@ function renderRun(rec) {
     </div>
     ${winnerHtml}
     ${researchHtml}
+    ${boardHtml}
     ${rec.error ? `<div class="detail-card" style="margin-top:12px;border-color:rgba(217,56,41,0.35);color:var(--red);">${escapeHtml(rec.error)}</div>` : ""}
     ${rec.status === "completed" ? `
       <div class="action-bar">
@@ -1084,6 +1200,8 @@ function renderRun(rec) {
             <span class="badge ${a.tests_ok ? 'ok' : 'fail'}">${a.tests_ok ? 'Verified' : 'Failed'}</span>
             ${a.repair_attempts ? `<span class="badge warn">Self-Healed ×${a.repair_attempts}</span>` : ""}
             ${a.review ? `<span class="badge ${a.review.verdict === 'approve' ? 'ok' : (a.review.verdict === 'block' ? 'fail' : 'warn')}">Critic: ${escapeHtml(a.review.verdict)}</span>` : ""}
+            ${a.review ? `<span class="badge ${(a.review.eligibility && a.review.eligibility.cross_vendor) ? 'ok' : 'warn'}">${(a.review.eligibility && a.review.eligibility.cross_vendor) ? 'Cross-Vendor Verified' : 'Same-Vendor Fresh'}</span>` : ""}
+            ${a.review && a.review.test_quality ? `<span class="badge ${a.review.test_quality === 'weak' ? 'warn' : 'ok'}">Tests: ${escapeHtml(a.review.test_quality)}</span>` : ""}
             ${a.tok_s != null ? `<span class="badge">${a.completion_tokens || 0} tok · ${a.tok_s} t/s</span>` : ""}
             ${applied.has(a.agent_id) ? `<span class="badge ok">Applied</span>` : ""}
             <div class="spacer"></div>
@@ -1262,7 +1380,7 @@ async function sendAsk() {
   try {
     const resp = await fetch("/api/chat/stream", {
       method: "POST",
-      headers: {"Content-Type": "application/json"},
+      headers: {"Content-Type": "application/json", "X-OpenSwarm-CSRF": getCsrfToken()},
       body: JSON.stringify({
         backend_url: document.getElementById("backendUrl").value,
         model: document.getElementById("modelName").value,
@@ -1341,6 +1459,7 @@ document.getElementById("goalInput").addEventListener("keydown", e => {
 
 async function init() {
   const cfg = await api("/api/config");
+  if (cfg.csrf_token) csrfToken = cfg.csrf_token;
   selfBuildPath = cfg.self_build_repo || cfg.default_repo || "";
   const sel = document.getElementById("presetSelect");
   sel.innerHTML = cfg.presets.map(p => `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)}</option>`).join("");

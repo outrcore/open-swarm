@@ -410,5 +410,372 @@ class TestSwarmNodeRemoteBundleE2E(unittest.TestCase):
                 node.stop()
 
 
+class TestSwarmNodePhase2D(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="swarm_node_2d_"))
+        self.state_path = self.tmp / "node_state.json"
+        self.mirrors_dir = self.tmp / "mirrors"
+        self.repo = self.tmp / "origin_repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init"], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Tester"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "tester@example.com"], cwd=self.repo, check=True)
+        (self.repo / "base.txt").write_text("v1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "c1"], cwd=self.repo, check=True, capture_output=True)
+        self.commit1 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        full_bundle = self.tmp / "full.bundle"
+        subprocess.run(
+            ["git", "bundle", "create", str(full_bundle), "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        self.full_b64 = base64.b64encode(full_bundle.read_bytes()).decode("ascii")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pair(self, base: str, server: swarm_node.SwarmNodeServer) -> str:
+        code = server.state.generate_pair_code()
+        st, resp = _http_json(
+            f"{base}/node/pair",
+            method="POST",
+            payload={"pair_code": code, "client_label": "test-client"},
+        )
+        self.assertEqual(st, 200)
+        return resp["device_token"]
+
+    def test_live_telemetry_and_health_v040(self):
+        fake_smi = subprocess.CompletedProcess(
+            args=["nvidia-smi"],
+            returncode=0,
+            stdout="55.5, 2048, 16384\n",
+            stderr="",
+        )
+        with (
+            patch.object(swarm_node.shutil, "which", return_value="/usr/bin/nvidia-smi"),
+            patch.object(swarm_node.os.path, "isfile", return_value=True),
+            patch.object(swarm_node.subprocess, "run", return_value=fake_smi),
+            patch.object(swarm_node.os, "getloadavg", return_value=(2.0, 1.5, 1.0)),
+            patch.object(swarm_node.os, "cpu_count", return_value=8),
+            patch.object(swarm_node, "_probe_mem_avail_gb", return_value=14.25),
+        ):
+            telem = swarm_node.probe_live_telemetry()
+
+        self.assertEqual(telem["gpu_util_pct"], 55.5)
+        self.assertEqual(telem["gpu_mem_used_mb"], 2048)
+        self.assertEqual(telem["gpu_mem_total_mb"], 16384)
+        self.assertEqual(telem["mem_avail_gb"], 14.25)
+        self.assertEqual(telem["cpu_load_pct"], 25.0)
+
+        with swarm_node.SwarmNodeServer(
+            host="127.0.0.1",
+            port=0,
+            state_path=self.state_path,
+            mirrors_dir=self.mirrors_dir,
+            node_name="telem-node",
+        ) as srv:
+            base = f"http://127.0.0.1:{srv.port}"
+            token = self._pair(base, srv)
+            st, health = _http_json(
+                f"{base}/node/health",
+                method="GET",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(health["version"], "0.4.0")
+            self.assertIsInstance(health["capabilities"], list)
+            self.assertIn("telemetry", health)
+            self.assertIsInstance(health["mem_avail_gb"], float)
+            self.assertIn("gpu_util_pct", health["telemetry"])
+            self.assertIn("cpu_load_pct", health["telemetry"])
+
+    def test_allow_lan_warning_and_git_hook_hardening(self):
+        with self.assertWarns(RuntimeWarning) as cm:
+            res = swarm_node.validate_bind_host("0.0.0.0", allow_lan=True)
+        self.assertEqual(res, "0.0.0.0")
+        self.assertIn("SECURITY WARNING", str(cm.warning))
+        self.assertIn("non-Tailscale", str(cm.warning))
+
+        # Verify _git_run enforces core.hooksPath=/dev/null and core.fsmonitor=false
+        calls = []
+        orig_run = subprocess.run
+
+        def _spy_run(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            return orig_run(cmd, *args, **kwargs)
+
+        with patch.object(swarm_node.subprocess, "run", side_effect=_spy_run):
+            p = swarm_node._git_run(self.repo, "status", "--short")
+            self.assertEqual(p.returncode, 0)
+
+        self.assertTrue(calls)
+        git_cmd = calls[0]
+        self.assertEqual(git_cmd[:5], ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+
+    def test_incremental_bare_mirror_and_scoped_llm_proxy(self):
+        pkg_code = (
+            "```file:check_ver.py\n"
+            "import unittest\n"
+            "from pathlib import Path\n\n"
+            "class TestVer(unittest.TestCase):\n"
+            "    def test_v2(self):\n"
+            "        self.assertEqual(Path('base.txt').read_text().strip(), 'v2')\n\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n"
+            "```\n"
+        )
+
+        # Create commit 2 and an incremental bundle commit1..HEAD
+        (self.repo / "base.txt").write_text("v2\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "c2"], cwd=self.repo, check=True, capture_output=True)
+        commit2 = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        inc_bundle = self.tmp / "inc.bundle"
+        subprocess.run(
+            ["git", "bundle", "create", str(inc_bundle), f"{self.commit1}..HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+        )
+        inc_b64 = base64.b64encode(inc_bundle.read_bytes()).decode("ascii")
+
+        seen_auth_headers: list[str] = []
+
+        with MockOpenAIChatServer(pkg_code) as mock_llm:
+            # Wrap mock handler to record Authorization header sent to LLM
+            orig_do_post = mock_llm.srv.RequestHandlerClass.do_POST
+
+            def _wrapped_post(handler_self):
+                seen_auth_headers.append(handler_self.headers.get("Authorization") or "")
+                return orig_do_post(handler_self)
+
+            mock_llm.srv.RequestHandlerClass.do_POST = _wrapped_post
+
+            with swarm_node.SwarmNodeServer(
+                host="127.0.0.1",
+                port=0,
+                state_path=self.state_path,
+                mirrors_dir=self.mirrors_dir,
+                node_name="mirror-node",
+            ) as srv:
+                base = f"http://127.0.0.1:{srv.port}"
+                token = self._pair(base, srv)
+                auth = {"Authorization": f"Bearer {token}"}
+
+                # 1. Incremental before mirror seeded -> 409 mirror_miss
+                st_miss, resp_miss = _http_json(
+                    f"{base}/node/exec",
+                    method="POST",
+                    headers=auth,
+                    payload={
+                        "bundle_b64": inc_b64,
+                        "base_commit": commit2,
+                        "repo_key": "org/demo-repo",
+                        "incremental": True,
+                        "llm_proxy_url": mock_llm.url,
+                        "llm_proxy_token": "scoped-tok-abc",
+                        "task": {
+                            "id": "T-MISS",
+                            "title": "Check v2",
+                            "spec": "Write check_ver.py",
+                            "acceptance_cmd": "python3 -m unittest check_ver.py",
+                        },
+                        "model": "mock-coder",
+                    },
+                )
+                self.assertEqual(st_miss, 409)
+                self.assertTrue(resp_miss.get("mirror_miss"))
+
+                # 2. Seed bare mirror with full bundle
+                st_seed, resp_seed = _http_json(
+                    f"{base}/node/exec",
+                    method="POST",
+                    headers=auth,
+                    payload={
+                        "bundle_b64": self.full_b64,
+                        "base_commit": self.commit1,
+                        "repo_key": "org/demo-repo",
+                        "incremental": False,
+                        "llm_proxy_url": mock_llm.url,
+                        "llm_proxy_token": "scoped-tok-seed",
+                        "task": {
+                            "id": "T-SEED",
+                            "title": "Echo test",
+                            "spec": "Write check_ver.py",
+                            "acceptance_cmd": "python3 -c \"from pathlib import Path; assert Path('base.txt').read_text().strip() == 'v1'\"",
+                        },
+                        "model": "mock-coder",
+                    },
+                )
+                self.assertEqual(st_seed, 200, resp_seed)
+                self.assertTrue((self.mirrors_dir / "org_demo-repo.git" / "HEAD").is_file())
+
+                # 3. Incremental delta bundle updates mirror and sees base.txt == 'v2' + uses scoped proxy token
+                st_inc, resp_inc = _http_json(
+                    f"{base}/node/exec",
+                    method="POST",
+                    headers=auth,
+                    payload={
+                        "bundle_b64": inc_b64,
+                        "base_commit": commit2,
+                        "repo_key": "org/demo-repo",
+                        "incremental": True,
+                        "llm_proxy_url": mock_llm.url,
+                        "llm_proxy_token": "scoped-tok-xyz",
+                        "task": {
+                            "id": "T-INC",
+                            "title": "Verify v2",
+                            "spec": "Write check_ver.py checking base.txt == v2",
+                            "acceptance_cmd": "python3 -m unittest check_ver.py",
+                        },
+                        "model": "mock-coder",
+                    },
+                )
+                self.assertEqual(st_inc, 200, resp_inc)
+                self.assertTrue(resp_inc["result"]["tests_ok"])
+                self.assertIn("Bearer scoped-tok-xyz", seen_auth_headers)
+
+    def test_async_jobs_sse_stream_and_cancel(self):
+        pkg_code = (
+            "```file:job_mod.py\n"
+            "import unittest\n\n"
+            "def add(a, b):\n"
+            "    return a + b\n\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(2, 3), 5)\n\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n"
+            "```\n"
+        )
+
+        with MockOpenAIChatServer(pkg_code) as mock_llm:
+            with swarm_node.SwarmNodeServer(
+                host="127.0.0.1",
+                port=0,
+                state_path=self.state_path,
+                mirrors_dir=self.mirrors_dir,
+                inference_url=mock_llm.url,
+                node_name="async-node",
+            ) as srv:
+                base = f"http://127.0.0.1:{srv.port}"
+                token = self._pair(base, srv)
+                auth = {"Authorization": f"Bearer {token}"}
+
+                # Unauthorized -> 401
+                st_unauth, _ = _http_json(f"{base}/node/jobs", method="POST", payload={})
+                self.assertEqual(st_unauth, 401)
+
+                # Submit async job -> 202 queued
+                st_sub, sub_body = _http_json(
+                    f"{base}/node/jobs",
+                    method="POST",
+                    headers=auth,
+                    payload={
+                        "bundle_b64": self.full_b64,
+                        "base_commit": self.commit1,
+                        "task": {
+                            "id": "T-ASYNC-1",
+                            "title": "Write job_mod.py",
+                            "spec": "Create job_mod.py with add(a, b).",
+                            "acceptance_cmd": "python3 -m unittest job_mod.py",
+                        },
+                        "model": "mock-coder",
+                        "api_key": "test-key",
+                    },
+                )
+                self.assertEqual(st_sub, 202, sub_body)
+                job_id = sub_body["job_id"]
+                self.assertEqual(sub_body["status"], "queued")
+
+                # Consume SSE stream until EOF (terminates after event: done)
+                req = urllib.request.Request(
+                    f"{base}/node/jobs/{job_id}/stream",
+                    headers={**auth, "Accept": "text/event-stream"},
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    self.assertIn("text/event-stream", resp.headers.get("Content-Type", ""))
+                    raw_sse = resp.read().decode("utf-8")
+
+                self.assertIn("event: queued", raw_sse)
+                self.assertIn("event: done", raw_sse)
+
+                st_get, job_state = _http_json(
+                    f"{base}/node/jobs/{job_id}",
+                    method="GET",
+                    headers=auth,
+                )
+                self.assertEqual(st_get, 200)
+                self.assertEqual(job_state["status"], "completed")
+                self.assertTrue(job_state["result"]["tests_ok"])
+                self.assertGreaterEqual(len(job_state["events"]), 2)
+
+                # Test cancellation on a blocked LLM call
+                gate = threading.Event()
+                orig_do_post = mock_llm.srv.RequestHandlerClass.do_POST
+
+                def _slow_post(handler_self):
+                    gate.wait(timeout=5.0)
+                    return orig_do_post(handler_self)
+
+                mock_llm.srv.RequestHandlerClass.do_POST = _slow_post
+                try:
+                    st_csub, csub = _http_json(
+                        f"{base}/node/jobs",
+                        method="POST",
+                        headers=auth,
+                        payload={
+                            "bundle_b64": self.full_b64,
+                            "base_commit": self.commit1,
+                            "task": {
+                                "id": "T-CANCEL-1",
+                                "title": "Slow job",
+                                "spec": "Write job_mod.py",
+                                "acceptance_cmd": "python3 -m unittest job_mod.py",
+                            },
+                            "model": "mock-coder",
+                        },
+                    )
+                    self.assertEqual(st_csub, 202)
+                    cjob_id = csub["job_id"]
+
+                    st_can, can_body = _http_json(
+                        f"{base}/node/jobs/{cjob_id}/cancel",
+                        method="POST",
+                        headers=auth,
+                        payload={},
+                    )
+                    self.assertEqual(st_can, 200)
+                    self.assertEqual(can_body["status"], "cancelled")
+
+                    req2 = urllib.request.Request(
+                        f"{base}/node/jobs/{cjob_id}/stream",
+                        headers={**auth, "Accept": "text/event-stream"},
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req2, timeout=15) as resp2:
+                        sse2 = resp2.read().decode("utf-8")
+                    self.assertIn("event: cancelled", sse2)
+                    self.assertIn("event: done", sse2)
+                finally:
+                    gate.set()
+                    mock_llm.srv.RequestHandlerClass.do_POST = orig_do_post
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

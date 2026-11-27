@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "outrcore-open-swarm"
-version = "0.1.0"
-description = "Apple-clean agent-first parallel coding swarm with git worktree isolation, self-healing tests, and continuity context guards."
+version = "0.4.0"
+description = "Apple-clean agent-first parallel coding swarm with git worktree isolation, Swarm Message Board, OS sandboxing, Tailscale compute mesh, and continuity context guards."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -21,8 +21,13 @@ open-swarm = "desktop_server:main"
 py-modules = [
   "desktop_server",
   "swarm_run",
+  "agent_loop",
+  "agent_tools",
   "orchestrator",
   "continuity_store",
   "fleet_scanner",
   "metering",
+  "research_loop",
+  "device_mesh",
+  "swarm_node",
 ]

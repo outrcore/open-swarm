@@ -815,6 +815,167 @@ class DesktopServerTests(unittest.TestCase):
             mock_oai.shutdown()
             mock_oai.server_close()
 
+    def test_v040_csrf_board_proxy_cancel_and_merge_gate(self) -> None:
+        # 1) HTML injects open-swarm-csrf meta tag & /api/config returns v0.4.0 + token
+        html = urllib.request.urlopen(f"{self.base}/", timeout=5.0).read().decode("utf-8")
+        self.assertIn('name="open-swarm-csrf"', html)
+        st_cfg, cfg = _http_json(f"{self.base}/api/config")
+        self.assertEqual(st_cfg, 200)
+        self.assertEqual(cfg["version"], "0.4.0")
+        csrf_tok = cfg["csrf_token"]
+
+        # 2) Bad Host, bad Origin, and browser Origin without X-OpenSwarm-CSRF are blocked (403)
+        req_bad_host = urllib.request.Request(f"{self.base}/health", headers={"Host": "evil.example:18790"})
+        with self.assertRaises(urllib.error.HTTPError) as h_ctx:
+            urllib.request.urlopen(req_bad_host, timeout=5.0)
+        self.assertEqual(h_ctx.exception.code, 403)
+        h_ctx.exception.close()
+
+        req_bad_orig = urllib.request.Request(
+            f"{self.base}/api/board/post",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as o_ctx:
+            urllib.request.urlopen(req_bad_orig, timeout=5.0)
+        self.assertEqual(o_ctx.exception.code, 403)
+        o_ctx.exception.close()
+
+        req_no_csrf = urllib.request.Request(
+            f"{self.base}/api/board/post",
+            data=b'{"run_id":"r1","from_agent":"coder-a","kind":"FINDING","body":"hi"}',
+            headers={"Content-Type": "application/json", "Origin": self.base},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as c_ctx:
+            urllib.request.urlopen(req_no_csrf, timeout=5.0)
+        self.assertEqual(c_ctx.exception.code, 403)
+        c_ctx.exception.close()
+
+        # 3) Valid CSRF + Board claim, conflict 409, decision, and SSE stream
+        req_ok = urllib.request.Request(
+            f"{self.base}/api/board/post",
+            data=json.dumps({"run_id": "r_board", "from_agent": "coder-a", "kind": "NEED_DECISION", "body": "SQLite or JSON?"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Origin": self.base, "X-OpenSwarm-CSRF": csrf_tok},
+            method="POST",
+        )
+        with urllib.request.urlopen(req_ok, timeout=5.0) as r:
+            need_msg = json.loads(r.read().decode("utf-8"))
+        self.assertEqual(need_msg["kind"], "NEED_DECISION")
+
+        st_cl, cl1 = _http_json(
+            f"{self.base}/api/board/claim",
+            method="POST",
+            payload={"run_id": "r_board", "rel_path": "pkg/api.py", "owner_agent": "coder-a"},
+        )
+        self.assertEqual(st_cl, 200)
+        self.assertTrue(cl1["claimed"])
+
+        with self.assertRaises(urllib.error.HTTPError) as cl_ctx:
+            _http_json(
+                f"{self.base}/api/board/claim",
+                method="POST",
+                payload={"run_id": "r_board", "rel_path": "pkg/api.py", "owner_agent": "coder-b"},
+            )
+        self.assertEqual(cl_ctx.exception.code, 409)
+        cl_ctx.exception.close()
+
+        st_res, res_d = _http_json(
+            f"{self.base}/api/board/resolve",
+            method="POST",
+            payload={"seq": need_msg["seq"], "resolution": "Use SQLite", "resolver": "matt"},
+        )
+        self.assertEqual(st_res, 200)
+        self.assertTrue(res_d["resolved"])
+
+        sse_raw = urllib.request.urlopen(f"{self.base}/api/board/stream?run_id=r_board&once=1", timeout=5.0).read().decode("utf-8")
+        self.assertIn("event: message", sse_raw)
+        self.assertIn("Use SQLite", sse_raw)
+
+        # 4) Scoped Coordinator LLM Proxy forwards upstream key without leaking to worker
+        seen_auth = {}
+
+        class _ProxyUpstreamHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                seen_auth["auth"] = self.headers.get("Authorization")
+                n = int(self.headers.get("Content-Length", "0") or "0")
+                _ = self.rfile.read(n)
+                raw = json.dumps({"choices": [{"message": {"role": "assistant", "content": "proxied"}}]}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        up_srv = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyUpstreamHandler)
+        up_port = up_srv.server_address[1]
+        threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+        try:
+            ptok = self.state.issue_proxy_token(
+                run_id="r_proxy",
+                base_url=f"http://127.0.0.1:{up_port}/v1",
+                api_key="sk_secret_upstream_12345",
+            )
+            p_req = urllib.request.Request(
+                f"{self.base}/api/llm/proxy/v1/chat/completions",
+                data=b'{"model":"m","messages":[]}',
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {ptok}"},
+                method="POST",
+            )
+            with urllib.request.urlopen(p_req, timeout=5.0) as r:
+                pres = json.loads(r.read().decode("utf-8"))
+            self.assertEqual(pres["choices"][0]["message"]["content"], "proxied")
+            self.assertEqual(seen_auth["auth"], "Bearer sk_secret_upstream_12345")
+            self.state.revoke_run_proxy_tokens("r_proxy")
+        finally:
+            up_srv.shutdown()
+            up_srv.server_close()
+
+        # 5) Post-merge integration gate blocks failing combined tests without modifying repo
+        rec_pass = {
+            "run_id": "gate-run-1",
+            "repo": str(self.repo_dir),
+            "status": "completed",
+            "tasks": [{"title": "T1", "acceptance_cmd": "true"}],
+            "results": [
+                {
+                    "agent_id": "coder-a",
+                    "tests_ok": True,
+                    "written_files": ["gated.txt"],
+                    "diff": "diff --git a/gated.txt b/gated.txt\nnew file mode 100644\nindex 0000000..ce01362\n--- /dev/null\n+++ b/gated.txt\n@@ -0,0 +1 @@\n+hello\n",
+                }
+            ],
+            "applied_agents": [],
+        }
+        self.state._save_run(rec_pass)
+        with self.assertRaises(urllib.error.HTTPError) as g_ctx:
+            _http_json(
+                f"{self.base}/api/runs/gate-run-1/apply-all",
+                method="POST",
+                payload={"verify_cmd": "python3 -c 'import sys; sys.exit(1)'"},
+            )
+        self.assertEqual(g_ctx.exception.code, 400)
+        g_ctx.exception.close()
+        self.assertFalse((self.repo_dir / "gated.txt").exists())
+
+        st_ok_g, ap_g = _http_json(
+            f"{self.base}/api/runs/gate-run-1/apply-all",
+            method="POST",
+            payload={"verify_cmd": "test -f gated.txt"},
+        )
+        self.assertEqual(st_ok_g, 200)
+        self.assertTrue((self.repo_dir / "gated.txt").is_file())
+        self.assertTrue(ap_g["integration_gate"]["ok"])
+
+        # 6) Cancel active run endpoint
+        st_cxl, cxl = _http_json(f"{self.base}/api/runs/gate-run-1/cancel", method="POST", payload={})
+        self.assertEqual(st_cxl, 200)
+        self.assertTrue(cxl["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

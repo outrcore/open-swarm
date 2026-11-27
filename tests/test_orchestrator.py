@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import tempfile
+import threading
 import unittest
 
 SWARM_DIR = Path(__file__).resolve().parents[1]
@@ -14,8 +16,11 @@ if str(SWARM_DIR) not in sys.path:
 from orchestrator import (  # noqa: E402
     LANES,
     check_review_eligibility,
+    plan_task_dag,
     resolve_vendor,
     review_agent_diff,
+    review_and_repair_agent,
+    run_dag_waves,
     run_tournament,
 )
 
@@ -456,6 +461,441 @@ class RunTournamentTests(unittest.TestCase):
         self.assertEqual(rec["agents_count"], 2)
         self.assertEqual(rec["passed_count"], 2)
         self.assertEqual(rec["tournament"]["winner_agent_id"], "cand-a")
+
+
+class DagSchedulerTests(unittest.TestCase):
+    def test_plan_task_dag_default_ids_and_phases(self) -> None:
+        tasks = [
+            {"title": "Define API schema", "phase": "contract"},
+            {"title": "Implement service", "phase": "impl"},
+            {"title": "Implement client", "phase": "impl"},
+            {"title": "Integration check", "phase": "verify"},
+        ]
+        waves = plan_task_dag(tasks)
+        self.assertEqual(len(waves), 3)
+        self.assertEqual([t["id"] for t in waves[0]], ["t0"])
+        self.assertEqual([t["id"] for t in waves[1]], ["t1", "t2"])
+        self.assertEqual([t["id"] for t in waves[2]], ["t3"])
+        self.assertEqual(waves[1][0]["depends_on"], ["t0"])
+        self.assertEqual(waves[2][0]["depends_on"], ["t0", "t1", "t2"])
+
+    def test_plan_task_dag_explicit_depends_on_and_mixed_phases(self) -> None:
+        tasks = [
+            {"id": "c1", "phase": "contract"},
+            {"id": "i1", "phase": "impl"},
+            {"id": "i2", "phase": "impl", "depends_on": ["i1"]},
+            {"id": "v1", "phase": "verify"},
+        ]
+        waves = plan_task_dag(tasks)
+        self.assertEqual(
+            [[t["id"] for t in w] for w in waves],
+            [["c1"], ["i1"], ["i2"], ["v1"]],
+        )
+
+    def test_plan_task_dag_missing_dependency_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            plan_task_dag([{"id": "a", "depends_on": ["nonexistent"]}])
+
+    def test_plan_task_dag_cycle_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            plan_task_dag(
+                [
+                    {"id": "a", "depends_on": ["b"]},
+                    {"id": "b", "depends_on": ["a"]},
+                ]
+            )
+        with self.assertRaises(ValueError):
+            plan_task_dag([{"id": "self", "depends_on": ["self"]}])
+
+    def test_run_dag_waves_forwards_contract_context(self) -> None:
+        tasks = [
+            {"id": "c0", "title": "Schema", "phase": "contract"},
+            {"id": "i0", "title": "Server", "phase": "impl"},
+            {"id": "v0", "title": "Verify", "phase": "verify"},
+        ]
+        seen_contexts: list[tuple[int, str]] = []
+
+        def fake_exec(wave_idx: int, wave_tasks: list[dict], context: str) -> list[dict]:
+            seen_contexts.append((wave_idx, context))
+            if wave_idx == 0:
+                return [
+                    {
+                        "id": "c0",
+                        "phase": "contract",
+                        "contract": "POST /v1/items -> 201 {id: str}",
+                        "summary": "Defined HTTP contract",
+                        "tests_ok": True,
+                    }
+                ]
+            if wave_idx == 1:
+                return [
+                    {
+                        "id": "i0",
+                        "summary": "Implemented POST /v1/items handler",
+                        "written_files": ["server.py"],
+                        "tests_ok": True,
+                    }
+                ]
+            return [{"id": "v0", "summary": "All E2E checks passed", "tests_ok": True}]
+
+        res = run_dag_waves(tasks, fake_exec)
+        self.assertFalse(res["cancelled"])
+        self.assertEqual(len(res["waves"]), 3)
+        self.assertEqual(len(res["results"]), 3)
+        self.assertEqual(seen_contexts[0], (0, ""))
+        self.assertIn("CONTRACT", seen_contexts[1][1])
+        self.assertIn("POST /v1/items -> 201 {id: str}", seen_contexts[1][1])
+        self.assertIn("POST /v1/items -> 201 {id: str}", seen_contexts[2][1])
+        self.assertIn("Implemented POST /v1/items handler", seen_contexts[2][1])
+
+    def test_run_dag_waves_cancellation_between_waves(self) -> None:
+        cancel = threading.Event()
+        tasks = [
+            {"id": "w0", "phase": "contract"},
+            {"id": "w1", "phase": "impl"},
+        ]
+
+        def fake_exec(wave_idx: int, wave_tasks: list[dict], _context: str) -> list[dict]:
+            cancel.set()
+            return [{"id": wave_tasks[0]["id"], "summary": "done"}]
+
+        res = run_dag_waves(tasks, fake_exec, cancel_event=cancel)
+        self.assertTrue(res["cancelled"])
+        self.assertEqual(len(res["waves"]), 1)
+        self.assertEqual(len(res["results"]), 1)
+        self.assertEqual(res["results"][0]["id"], "w0")
+
+        res_immediate = run_dag_waves(tasks, fake_exec, cancel_event=cancel)
+        self.assertTrue(res_immediate["cancelled"])
+        self.assertEqual(res_immediate["waves"], [])
+        self.assertEqual(res_immediate["results"], [])
+
+
+class ReviewAgentDiffPhase2CTests(unittest.TestCase):
+    def test_test_quality_rubric_normalization_and_review_mode(self) -> None:
+        captured: list[dict] = []
+
+        def strict_openai_chat_sig(*, base_url, api_key, model, messages, max_tokens=4096, temperature=0.0, stream=False):
+            captured.append({"messages": messages})
+            return {
+                "content": json.dumps(
+                    {
+                        "verdict": "request_changes",
+                        "test_quality": "WEAK",
+                        "summary": "Tautological assertion.",
+                        "findings": [
+                            {
+                                "severity": "high",
+                                "file": "tests/test_app.py",
+                                "issue": "Only asserts True",
+                                "fix": "Assert actual return value",
+                            }
+                        ],
+                    }
+                ),
+                "completion_tokens": 20,
+            }
+
+        res = review_agent_diff(
+            ticket_title="Add parser",
+            ticket_spec="Parse JSON safely",
+            diff="--- a/app.py\n+++ b/app.py\n+assert True\n",
+            test_output="OK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="gpt-4o",
+            allow_same_vendor_fresh=True,
+            worktree=None,
+            chat_fn=strict_openai_chat_sig,
+        )
+        sys_msg = captured[0]["messages"][0]["content"]
+        self.assertIn("assert True", sys_msg)
+        self.assertIn("test_quality", sys_msg)
+        self.assertEqual(res["test_quality"], "weak")
+        self.assertEqual(res["review_mode"], "same_vendor_fresh")
+        self.assertEqual(res["inspected_files"], [])
+
+        # Legacy mock omitting test_quality defaults to "adequate"
+        res_legacy = review_agent_diff(
+            ticket_title="Add parser",
+            ticket_spec="Parse JSON safely",
+            diff="+x = 1",
+            test_output="OK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="claude-sonnet-4",
+            chat_fn=lambda **_kw: {"content": json.dumps({"verdict": "approve", "summary": "OK", "findings": []})},
+        )
+        self.assertEqual(res_legacy["test_quality"], "adequate")
+        self.assertEqual(res_legacy["review_mode"], "cross_vendor")
+
+    def test_tool_enabled_critic_native_tool_calls_reads_untouched_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "helpers.py").write_text("def normalize_token(s):\n    return s.strip().lower()\n", encoding="utf-8")
+            (wt / "tests").mkdir()
+            (wt / "tests" / "test_helpers.py").write_text("def test_norm():\n    assert True\n", encoding="utf-8")
+
+            turns: list[dict] = []
+
+            def fake_chat(**kwargs):
+                turns.append(kwargs)
+                idx = len(turns)
+                if idx == 1:
+                    self.assertIn("tools", kwargs)
+                    return {
+                        "content": "",
+                        "tool_calls": [
+                            {"id": "c1", "function": {"name": "list_dir", "arguments": {"path": "."}}},
+                            {"id": "c2", "function": {"name": "search_code", "arguments": {"query": "normalize_token"}}},
+                            {"id": "c3", "function": {"name": "read_file", "arguments": {"path": "helpers.py"}}},
+                            {"id": "c4", "function": {"name": "edit_file", "arguments": {"path": "helpers.py", "old_text": "a", "new_text": "b"}}},
+                        ],
+                        "completion_tokens": 15,
+                    }
+                # Verify tool outputs were fed back to the model
+                tool_msgs = [m for m in kwargs["messages"] if m.get("role") == "tool"]
+                self.assertEqual(len(tool_msgs), 4)
+                self.assertIn("normalize_token", tool_msgs[2]["content"])
+                self.assertIn("disabled in read-only", tool_msgs[3]["content"])
+                return {
+                    "content": json.dumps(
+                        {
+                            "verdict": "approve",
+                            "test_quality": "strong",
+                            "summary": "Verified untouched helper signature.",
+                            "findings": [],
+                        }
+                    ),
+                    "completion_tokens": 25,
+                    "tok_s": 70.0,
+                }
+
+            res = review_agent_diff(
+                ticket_title="Use helper",
+                ticket_spec="Call normalize_token",
+                diff="--- a/app.py\n+++ b/app.py\n+from helpers import normalize_token\n",
+                test_output="Ran 3 tests in 0.01s\nOK",
+                author_model="gpt-4o",
+                reviewer_base_url="http://127.0.0.1:9999/v1",
+                reviewer_model="claude-sonnet-4",
+                worktree=wt,
+                max_tool_turns=4,
+                chat_fn=fake_chat,
+            )
+
+            self.assertEqual(len(turns), 2)
+            self.assertEqual(res["verdict"], "approve")
+            self.assertEqual(res["test_quality"], "strong")
+            self.assertEqual(res["review_mode"], "cross_vendor")
+            self.assertEqual(res["inspected_files"], ["helpers.py"])
+            self.assertEqual(res["completion_tokens"], 40)
+            self.assertEqual(res["tok_s"], 70.0)
+            self.assertEqual((wt / "helpers.py").read_text(encoding="utf-8"), "def normalize_token(s):\n    return s.strip().lower()\n")
+
+    def test_tool_enabled_critic_fenced_tool_blocks_and_turn_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            (wt / "untouched.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+            calls = 0
+
+            def fake_chat(**kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return {
+                        "content": 'Let me read untouched.py.\n```tool\n{"name": "read_file", "arguments": {"path": "untouched.py"}}\n```',
+                        "completion_tokens": 10,
+                    }
+                # Turn 2 after max_tool_turns=1 reached: tools should be None
+                self.assertIsNone(kwargs.get("tools"))
+                user_msgs = [m["content"] for m in kwargs["messages"] if m.get("role") == "user"]
+                self.assertTrue(any("VALUE = 42" in msg for msg in user_msgs))
+                return {
+                    "content": json.dumps(
+                        {
+                            "verdict": "request_changes",
+                            "test_quality": "weak",
+                            "summary": "Needs real assertions.",
+                            "findings": [{"severity": "medium", "file": "app.py", "issue": "Missing test", "fix": "Add test"}],
+                        }
+                    ),
+                    "completion_tokens": 20,
+                }
+
+            res = review_agent_diff(
+                ticket_title="Read value",
+                ticket_spec="Use VALUE",
+                diff="+x = 1",
+                test_output="OK",
+                author_model="gpt-4o",
+                reviewer_base_url="http://127.0.0.1:9999/v1",
+                reviewer_model="gemini-2.5-pro",
+                worktree=wt,
+                max_tool_turns=1,
+                chat_fn=fake_chat,
+            )
+
+            self.assertEqual(calls, 2)
+            self.assertEqual(res["verdict"], "request_changes")
+            self.assertEqual(res["test_quality"], "weak")
+            self.assertEqual(res["inspected_files"], ["untouched.py"])
+
+
+class ReviewAndRepairAgentTests(unittest.TestCase):
+    def test_approve_immediately_skips_repair(self) -> None:
+        repair_called = False
+
+        def fake_repair(_findings, _review):
+            nonlocal repair_called
+            repair_called = True
+            return {"diff": "+repaired", "test_output": "OK"}
+
+        res = review_and_repair_agent(
+            ticket_title="Clean change",
+            ticket_spec="Do work",
+            diff="+good = 1",
+            test_output="Ran 2 tests\nOK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="claude-sonnet-4",
+            max_repair_rounds=2,
+            repair_fn=fake_repair,
+            chat_fn=lambda **_kw: {
+                "content": json.dumps({"verdict": "approve", "test_quality": "strong", "summary": "LGTM", "findings": []})
+            },
+        )
+        self.assertFalse(repair_called)
+        self.assertFalse(res["repair_attempted"])
+        self.assertEqual(res["repair_rounds"], 0)
+        self.assertEqual(len(res["history"]), 1)
+        self.assertEqual(res["verdict"], "approve")
+
+    def test_ineligible_or_zero_rounds_skips_repair(self) -> None:
+        res_blocked = review_and_repair_agent(
+            ticket_title="Blocked",
+            ticket_spec="Spec",
+            diff="+x = 1",
+            test_output="OK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="o3-mini",
+            allow_same_vendor_fresh=False,
+            max_repair_rounds=2,
+            repair_fn=lambda _f, _r: {"diff": "+y", "test_output": "OK"},
+            chat_fn=lambda **_kw: {"content": "{}"},
+        )
+        self.assertFalse(res_blocked["repair_attempted"])
+        self.assertEqual(res_blocked["repair_rounds"], 0)
+        self.assertEqual(len(res_blocked["history"]), 1)
+        self.assertEqual(res_blocked["verdict"], "block")
+
+    def test_approve_after_one_repair_stops_early(self) -> None:
+        review_calls = 0
+
+        def fake_chat(**kwargs):
+            nonlocal review_calls
+            review_calls += 1
+            prompt_txt = "\n".join(m["content"] for m in kwargs["messages"])
+            if review_calls == 1:
+                self.assertIn("+buggy()", prompt_txt)
+                return {
+                    "content": json.dumps(
+                        {
+                            "verdict": "request_changes",
+                            "test_quality": "weak",
+                            "summary": "Missing null check",
+                            "findings": [
+                                {
+                                    "severity": "high",
+                                    "file": "app.py",
+                                    "issue": "Unhandled None",
+                                    "fix": "Guard against None",
+                                }
+                            ],
+                        }
+                    )
+                }
+            self.assertIn("+safe_guard()", prompt_txt)
+            return {
+                "content": json.dumps(
+                    {
+                        "verdict": "approve",
+                        "test_quality": "strong",
+                        "summary": "Fixed and well tested.",
+                        "findings": [],
+                    }
+                )
+            }
+
+        repair_inputs: list[tuple[list[dict], str]] = []
+
+        def fake_repair(findings, review):
+            repair_inputs.append((findings, review["verdict"]))
+            return {"diff": "+safe_guard()", "test_output": "Ran 4 tests\nOK"}
+
+        res = review_and_repair_agent(
+            ticket_title="Fix bug",
+            ticket_spec="Handle None",
+            diff="+buggy()",
+            test_output="Ran 1 test\nOK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="claude-sonnet-4",
+            max_repair_rounds=3,
+            repair_fn=fake_repair,
+            chat_fn=fake_chat,
+        )
+
+        self.assertEqual(review_calls, 2)
+        self.assertEqual(len(repair_inputs), 1)
+        self.assertEqual(repair_inputs[0][0][0]["issue"], "Unhandled None")
+        self.assertTrue(res["repair_attempted"])
+        self.assertEqual(res["repair_rounds"], 1)
+        self.assertEqual(len(res["history"]), 2)
+        self.assertEqual(res["initial_review"]["verdict"], "request_changes")
+        self.assertEqual(res["verdict"], "approve")
+        self.assertEqual(res["test_quality"], "strong")
+        self.assertEqual(res["diff"], "+safe_guard()")
+        self.assertEqual(res["test_output"], "Ran 4 tests\nOK")
+
+    def test_exhaust_max_repair_rounds(self) -> None:
+        repair_rounds_seen = 0
+
+        def fake_repair(_findings, _review):
+            nonlocal repair_rounds_seen
+            repair_rounds_seen += 1
+            return {"diff": f"+attempt_{repair_rounds_seen}", "test_output": "OK"}
+
+        res = review_and_repair_agent(
+            ticket_title="Hard fix",
+            ticket_spec="Handle edge cases",
+            diff="+initial",
+            test_output="OK",
+            author_model="gpt-4o",
+            reviewer_base_url="http://127.0.0.1:9999/v1",
+            reviewer_model="gemini-2.5-pro",
+            max_repair_rounds=2,
+            repair_fn=fake_repair,
+            chat_fn=lambda **_kw: {
+                "content": json.dumps(
+                    {
+                        "verdict": "request_changes",
+                        "test_quality": "adequate",
+                        "summary": "Still missing edge case",
+                        "findings": [{"severity": "medium", "file": "app.py", "issue": "Edge case", "fix": "Handle it"}],
+                    }
+                )
+            },
+        )
+
+        self.assertEqual(repair_rounds_seen, 2)
+        self.assertTrue(res["repair_attempted"])
+        self.assertEqual(res["repair_rounds"], 2)
+        self.assertEqual(len(res["history"]), 3)
+        self.assertEqual(res["verdict"], "request_changes")
+        self.assertEqual(res["diff"], "+attempt_2")
 
 
 if __name__ == "__main__":

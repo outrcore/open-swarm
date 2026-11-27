@@ -266,7 +266,13 @@ def openai_chat(
 
 
 def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, check=check)
+    return subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=check,
+    )
 
 
 def _prepare_shell_cmd_and_env(cmd: str) -> tuple[str, dict[str, str]]:
@@ -297,17 +303,25 @@ def run_swarm(
     auto_review: bool = False,
     continuity_store: Any = None,
     runs_dir: Path | None = None,
-    use_tool_loop: bool = False,
+    use_tool_loop: bool = True,
     max_tool_turns: int = 8,
     readonly_paths: list[str] | None = None,
     device_registry: Any = None,
     route_to_mesh: bool = True,
+    board_store: Any = None,
+    board_callback: Callable[..., Any] | None = None,
+    run_id: str | None = None,
+    sandbox_mode: str = "auto",
+    cancel_event: Any = None,
+    llm_proxy_url: str = "",
+    llm_proxy_token: str = "",
 ) -> dict[str, Any]:
     """Execute `tasks` in parallel isolated git worktrees and return metered diffs + test verdicts."""
     from agent_tools import build_agent_context_brief, detect_file_collisions
-    from orchestrator import review_agent_diff
+    from orchestrator import plan_task_dag, review_agent_diff
 
     repo = repo.resolve()
+    effective_board_store = board_store if board_store is not None else continuity_store
     meter = RunMeter(pricing=pricing, spend_cap_usd=spend_cap_usd)
     context_brief = (
         build_agent_context_brief(repo, continuity=continuity_store, runs_dir=runs_dir)
@@ -356,7 +370,7 @@ def run_swarm(
         except Exception:
             pass
         _emit_progress({"kind": "prewarm_done", "ok": pw_ok, "wall_s": round(time.monotonic() - t_pw0, 2)})
-    run_id = time.strftime("swarm-%Y%m%d-%H%M%S")
+    run_id = str(run_id or "").strip() or time.strftime("swarm-%Y%m%d-%H%M%S")
     wt_base = repo.parent / f".open_swarm_{run_id}"
     wt_base.mkdir(parents=True, exist_ok=True)
     t_start = time.monotonic()
@@ -456,6 +470,14 @@ def run_swarm(
                     remote_item = dict(item)
                     remote_item.setdefault("agent_id", agent_id)
                     remote_item.setdefault("id", ticket_id)
+                    _creds_host = str(creds.get("host") or "").strip().lower()
+                    _proxy_is_loopback = any(
+                        p in str(llm_proxy_url or "").lower()
+                        for p in ("//127.0.0.1", "//localhost", "//[::1]")
+                    )
+                    _use_proxy = bool(llm_proxy_url and llm_proxy_token) and (
+                        _creds_host in ("127.0.0.1", "localhost", "::1") or not _proxy_is_loopback
+                    )
                     remote_res = execute_task_on_remote_device(
                         repo=repo,
                         device_creds=creds,
@@ -466,6 +488,8 @@ def run_swarm(
                         spend_cap_usd=float(spend_cap_usd or 0.5),
                         max_repair_turns=int(max_repair_turns),
                         auto_review=bool(auto_review),
+                        llm_proxy_url=llm_proxy_url if _use_proxy else "",
+                        llm_proxy_token=llm_proxy_token if _use_proxy else "",
                     )
                     remote_res["agent_id"] = agent_id
                     remote_res["ticket"] = ticket_id
@@ -547,6 +571,8 @@ def run_swarm(
                 return resp_turn
 
             def _run_accept() -> None:
+                from agent_loop import scrub_secrets
+
                 _emit_agent("testing", force=True)
                 for pc_dir in wt.rglob("__pycache__"):
                     if pc_dir.is_dir():
@@ -562,18 +588,19 @@ def run_swarm(
                     timeout=60,
                 )
                 res_info["tests_ok"] = tproc.returncode == 0
-                res_info["test_output"] = (tproc.stdout + "\n" + tproc.stderr).strip()[-2000:]
+                res_info["test_output"] = scrub_secrets((tproc.stdout + "\n" + tproc.stderr).strip())[-2000:]
 
             resp: dict[str, Any] = {"content": "", "reasoning_content": ""}
             if item_use_tools:
-                from agent_loop import run_agent_loop
+                from agent_loop import run_agent_loop, scrub_secrets
 
                 tool_prompt = (
                     f"## Ticket {res_info['ticket']}: {title}\n"
                     f"{item['spec']}\n\n"
                     f"Acceptance command: `{item['acceptance_cmd']}`\n"
-                    "Use `read_file` / `search_code` to inspect files first, make surgical edits via `edit_file` or `write_file`, "
-                    "verify using `run_command`, optionally log insights with `write_note`, and call `finish` when verified."
+                    "Use `list_dir` / `read_file` / `search_code` to inspect files first, make surgical edits via "
+                    "`edit_file` or `write_file`, inspect changes with `git_diff`, verify using `run_command`, "
+                    "optionally log insights with `write_note`, and call `finish` when verified."
                 )
                 loop_res = run_agent_loop(
                     worktree=wt,
@@ -589,6 +616,12 @@ def run_swarm(
                     temperature=item_temp,
                     meter=meter,
                     on_progress=_emit_progress,
+                    on_delta=_on_delta,
+                    sandbox_mode=str(item.get("sandbox_mode") or sandbox_mode),
+                    board_store=effective_board_store,
+                    run_id=run_id,
+                    board_callback=board_callback,
+                    device_name=assigned_device_name,
                 )
                 res_info["turns"] = int(loop_res.get("turns") or 0)
                 res_info["tool_calls"] = int(loop_res.get("tool_calls") or 0)
@@ -596,11 +629,13 @@ def run_swarm(
                 res_info["completion_tokens"] += int(loop_res.get("completion_tokens") or 0)
                 res_info["prompt_tokens"] += int(loop_res.get("prompt_tokens") or 0)
                 res_info["cached_tokens"] += int(loop_res.get("cached_tokens") or 0)
-                res_info["output_preview"] = str(loop_res.get("summary") or loop_res.get("error") or "")[-1200:]
+                res_info["output_preview"] = scrub_secrets(
+                    str(loop_res.get("summary") or loop_res.get("error") or "")
+                )[-1200:]
                 for rel_w in loop_res.get("written_files") or []:
                     if rel_w not in written:
                         written.append(rel_w)
-                if item.get("acceptance_cmd"):
+                if (written or loop_res.get("ok")) and item.get("acceptance_cmd"):
                     _run_accept()
                 resp = {"content": res_info["output_preview"], "reasoning_content": ""}
             else:
@@ -670,6 +705,7 @@ def run_swarm(
                         reviewer_model=item_model,
                         api_key=api_key,
                         allow_same_vendor_fresh=True,
+                        worktree=wt,
                     )
                 except Exception:
                     pass
@@ -690,11 +726,15 @@ def run_swarm(
             res_info["stage"] = final_stage
             _emit_agent(final_stage, force=True)
         except SpendCapExceeded as exc:
-            res_info["error"] = str(exc)
+            from agent_loop import scrub_secrets
+
+            res_info["error"] = scrub_secrets(str(exc))
             res_info["stage"] = "failed"
             _emit_agent("failed", force=True)
         except Exception as exc:
-            res_info["error"] = f"{type(exc).__name__}: {exc}"
+            from agent_loop import scrub_secrets
+
+            res_info["error"] = scrub_secrets(f"{type(exc).__name__}: {exc}")
             res_info["stage"] = "failed"
             _emit_agent("failed", force=True)
         finally:
@@ -702,11 +742,19 @@ def run_swarm(
         return res_info
 
     agent_results: list[dict[str, Any]] = []
+    cancelled = False
     try:
-        with ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
-            futs = [pool.submit(worker, i, t) for i, t in enumerate(tasks)]
-            for f in as_completed(futs):
-                agent_results.append(f.result())
+        has_dag = any(t.get("depends_on") or t.get("phase") for t in tasks)
+        waves = plan_task_dag(tasks) if has_dag else [tasks]
+        idx_by_obj = {id(t): i for i, t in enumerate(tasks)}
+        for wave in waves:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+            with ThreadPoolExecutor(max_workers=max(1, len(wave))) as pool:
+                futs = [pool.submit(worker, idx_by_obj[id(t)], t) for t in wave]
+                for f in as_completed(futs):
+                    agent_results.append(f.result())
         agent_results.sort(key=lambda r: r["agent_id"])
     finally:
         if not keep_worktrees:
@@ -723,6 +771,7 @@ def run_swarm(
         "repo": str(repo),
         "backend_url": base_url,
         "model": model,
+        "cancelled": cancelled,
         "agents_count": len(tasks),
         "passed_count": sum(1 for r in agent_results if r["tests_ok"]),
         "collisions": detect_file_collisions(agent_results),

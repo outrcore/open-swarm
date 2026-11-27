@@ -7,6 +7,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from open_swarm.continuity_store import (
+    VALID_BOARD_KINDS,
     ContextConflictError,
     ContinuityStore,
     compute_file_hashes,
@@ -277,6 +279,245 @@ rename to open_swarm/new_name.py
         self.assertEqual(len(status["checkpoints"]), 1)
         self.assertEqual(len(status["actions"]), 1)
         self.assertEqual(len(status["messages"]), 4)
+
+    def test_board_schema_tables_and_index_initialized(self) -> None:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            self.assertTrue({"board_messages", "file_leases"}.issubset(tables))
+            indexes = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
+            self.assertIn("idx_board_messages_run_seq", indexes)
+        finally:
+            conn.close()
+
+    def test_board_validation_post_read_and_filtering(self) -> None:
+        self.assertEqual(
+            VALID_BOARD_KINDS,
+            (
+                "CLAIM_FILE",
+                "CONTRACT",
+                "FINDING",
+                "QUESTION",
+                "NEED_DECISION",
+                "BLOCKED",
+                "DONE",
+                "DECISION",
+            ),
+        )
+
+        with self.assertRaises(ValueError):
+            self.store.post_board_message("run-1", "agent-a", "UNKNOWN", "bad")
+        with self.assertRaises(ValueError):
+            self.store.post_board_message("", "agent-a", "FINDING", "missing run")
+        with self.assertRaises(ValueError):
+            self.store.post_board_message("run-1", "  ", "FINDING", "missing sender")
+
+        m1 = self.store.post_board_message(
+            "run-1",
+            "planner",
+            "CONTRACT",
+            "API frozen",
+            meta={"version": 1},
+        )
+        m2 = self.store.post_board_message(
+            "run-1",
+            "coder-1",
+            "QUESTION",
+            "Which port?",
+            to_agent="planner",
+        )
+        m3 = self.store.post_board_message(
+            "run-1",
+            "coder-2",
+            "FINDING",
+            "Found race condition",
+            to_agent="reviewer",
+        )
+        m4 = self.store.post_board_message(
+            "run-2",
+            "other",
+            "DONE",
+            "Unrelated run",
+        )
+
+        self.assertEqual(m1["to_agent"], "all")
+        self.assertEqual(m1["meta"], {"version": 1})
+        self.assertFalse(m1["resolved"])
+
+        # Direct to planner + broadcast ('all'), excluding reviewer-only m3 and run-2 m4
+        planner_msgs = self.store.read_board_messages("run-1", to_agent="planner")
+        self.assertEqual([m["seq"] for m in planner_msgs], [m1["seq"], m2["seq"]])
+
+        # since_seq paging
+        paged = self.store.read_board_messages(
+            "run-1", since_seq=m1["seq"], to_agent="planner"
+        )
+        self.assertEqual([m["seq"] for m in paged], [m2["seq"]])
+
+        # to_agent="all" or None returns all run-1 messages
+        all_run1 = self.store.read_board_messages("run-1", to_agent="all")
+        self.assertEqual(
+            [m["seq"] for m in all_run1], [m1["seq"], m2["seq"], m3["seq"]]
+        )
+        self.assertNotIn(m4["seq"], [m["seq"] for m in all_run1])
+
+        # kind filter and limit
+        findings = self.store.read_board_messages("run-1", kind="FINDING")
+        self.assertEqual([m["seq"] for m in findings], [m3["seq"]])
+        limited = self.store.read_board_messages("run-1", limit=2)
+        self.assertEqual([m["seq"] for m in limited], [m1["seq"], m2["seq"]])
+
+    def test_resolve_board_decision(self) -> None:
+        q = self.store.post_board_message(
+            "run-dec",
+            "coder-1",
+            "NEED_DECISION",
+            "Use WAL or DELETE journal mode?",
+            to_agent="lead",
+        )
+        resolved = self.store.resolve_board_decision(
+            q["seq"], "Use WAL mode", resolver="lead"
+        )
+        self.assertTrue(resolved["resolved"])
+        self.assertEqual(resolved["resolution"], "Use WAL mode")
+        self.assertEqual(resolved["resolved_by"], "lead")
+        self.assertIsNotNone(resolved["resolved_at"])
+
+        coder_inbox = self.store.read_board_messages(
+            "run-dec", since_seq=q["seq"], to_agent="coder-1"
+        )
+        self.assertEqual(len(coder_inbox), 1)
+        reply = coder_inbox[0]
+        self.assertEqual(reply["kind"], "DECISION")
+        self.assertEqual(reply["from_agent"], "lead")
+        self.assertEqual(reply["to_agent"], "coder-1")
+        self.assertEqual(reply["body"], "Use WAL mode")
+        self.assertEqual(reply["meta"], {"reply_to_seq": q["seq"]})
+
+        with self.assertRaises(ValueError):
+            self.store.resolve_board_decision(999999, "nope")
+
+    def test_file_leases_claim_conflict_renew_expire_and_release(self) -> None:
+        # Fresh claim normalizes path and emits a CLAIM_FILE board message
+        c1 = self.store.claim_file_lease(
+            "run-lease", "./open_swarm//app.py", "agent-a", ttl_s=30.0
+        )
+        self.assertTrue(c1["claimed"])
+        self.assertEqual(c1["rel_path"], "open_swarm/app.py")
+        self.assertEqual(c1["owner"], "agent-a")
+
+        board_claims = self.store.read_board_messages("run-lease", kind="CLAIM_FILE")
+        self.assertEqual(len(board_claims), 1)
+        self.assertEqual(board_claims[0]["from_agent"], "agent-a")
+
+        # Conflict for another agent
+        c2 = self.store.claim_file_lease(
+            "run-lease", "open_swarm/app.py", "agent-b", ttl_s=30.0
+        )
+        self.assertFalse(c2["claimed"])
+        self.assertEqual(c2["owner"], "agent-a")
+        self.assertEqual(c2["expires_at"], c1["expires_at"])
+
+        # Same owner renews expiry without emitting a duplicate CLAIM_FILE event
+        time.sleep(0.01)
+        c3 = self.store.claim_file_lease(
+            "run-lease", "open_swarm/app.py", "agent-a", ttl_s=60.0
+        )
+        self.assertTrue(c3["claimed"])
+        self.assertGreater(c3["expires_at"], c1["expires_at"])
+        self.assertEqual(
+            len(self.store.read_board_messages("run-lease", kind="CLAIM_FILE")), 1
+        )
+
+        # Release restricted by owner_agent
+        self.assertFalse(
+            self.store.release_file_lease(
+                "run-lease", "open_swarm/app.py", owner_agent="agent-b"
+            )
+        )
+        self.assertTrue(
+            self.store.release_file_lease(
+                "run-lease", "./open_swarm/app.py", owner_agent="agent-a"
+            )
+        )
+        self.assertFalse(
+            self.store.release_file_lease("run-lease", "open_swarm/app.py")
+        )
+
+        # Short TTL expiration allows re-claim by another agent
+        exp_claim = self.store.claim_file_lease(
+            "run-lease", "z_last.py", "agent-a", ttl_s=0.02
+        )
+        self.assertTrue(exp_claim["claimed"])
+        time.sleep(0.03)
+        reclaimed = self.store.claim_file_lease(
+            "run-lease", "z_last.py", "agent-b", ttl_s=30.0
+        )
+        self.assertTrue(reclaimed["claimed"])
+        self.assertEqual(reclaimed["owner"], "agent-b")
+
+        # list_file_leases prunes expired and returns active ordered by rel_path
+        self.store.claim_file_lease("run-lease", "expired.py", "agent-a", ttl_s=0.01)
+        self.store.claim_file_lease("run-lease", "a_first.py", "agent-c", ttl_s=30.0)
+        time.sleep(0.02)
+        active = self.store.list_file_leases("run-lease")
+        self.assertEqual([l["rel_path"] for l in active], ["a_first.py", "z_last.py"])
+        self.assertEqual([l["owner_agent"] for l in active], ["agent-c", "agent-b"])
+
+    def test_file_lease_path_traversal_and_absolute_rejection(self) -> None:
+        bad_paths = [
+            "",
+            "   ",
+            ".",
+            "../secret.py",
+            "a/../../secret.py",
+            "a/../b.py",
+            "/etc/passwd",
+            "foo\x00bar.py",
+        ]
+        for bad in bad_paths:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    self.store.claim_file_lease("run-sec", bad, "agent-a")
+                with self.assertRaises(ValueError):
+                    self.store.release_file_lease("run-sec", bad)
+
+    def test_file_lease_concurrent_claim_atomicity(self) -> None:
+        barrier = threading.Barrier(4)
+        results: list[dict[str, object]] = []
+        lock = threading.Lock()
+
+        def worker(agent_name: str) -> None:
+            barrier.wait()
+            res = self.store.claim_file_lease("run-race", "shared.py", agent_name)
+            with lock:
+                results.append(res)
+
+        threads = [
+            threading.Thread(target=worker, args=(f"agent-{i}",)) for i in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        winners = [r for r in results if r["claimed"]]
+        losers = [r for r in results if not r["claimed"]]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(len(losers), 3)
+        winner_owner = winners[0]["owner"]
+        for loser in losers:
+            self.assertEqual(loser["owner"], winner_owner)
 
 
 if __name__ == "__main__":

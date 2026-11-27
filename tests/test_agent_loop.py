@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import inspect
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 SWARM_DIR = Path(__file__).resolve().parents[1]
 if str(SWARM_DIR) not in sys.path:
     sys.path.insert(0, str(SWARM_DIR))
 
-from agent_loop import TOOLS_SCHEMA, WorktreeToolkit, run_agent_loop  # noqa: E402
+from agent_loop import (  # noqa: E402
+    TOOLS_SCHEMA,
+    WorktreeToolkit,
+    _FALLBACK_TOOL_INSTRUCTIONS,
+    _KNOWN_TOOL_NAMES,
+    run_agent_loop,
+    scrub_secrets,
+)
+from continuity_store import ContinuityStore  # noqa: E402
 from metering import PricingSchedule, RunMeter, SpendCapExceeded  # noqa: E402
+from swarm_run import run_swarm  # noqa: E402
 
 
 def _sse_response(
@@ -657,9 +670,11 @@ class AgentLoopE2ETests(unittest.TestCase):
                 self.assertTrue(res["ok"])
                 self.assertEqual(len(srv.requests), 4)
                 final_msgs = srv.requests[3]["messages"]
-                # messages[0] and messages[1] preserved byte-for-byte
+                # messages[0] and turn-0 messages[1] preserved byte-for-byte across compaction
                 self.assertEqual(final_msgs[0]["content"], sys_prefix)
-                self.assertEqual(final_msgs[1]["content"], task_prompt)
+                self.assertEqual(final_msgs[1]["content"], srv.requests[0]["messages"][1]["content"])
+                self.assertIn(task_prompt, final_msgs[1]["content"])
+                self.assertIn("[Env] os=", final_msgs[1]["content"])
                 # Middle tool output (t1) compacted to concise 1-line stub
                 middle_tool_contents = [m["content"] for m in final_msgs[2:-4] if m.get("role") == "tool"]
                 self.assertTrue(middle_tool_contents)
@@ -701,6 +716,472 @@ class AgentLoopE2ETests(unittest.TestCase):
                         model="m",
                         meter=meter,
                     )
+
+
+class Phase2BSecretScrubberTests(unittest.TestCase):
+    def test_scrub_secrets_redacts_all_patterns(self) -> None:
+        samples = [
+            ("sk-1234567890abcdef1234", "[REDACTED]"),
+            ("sk-proj-abcdef1234567890_XYZ", "[REDACTED]"),
+            ("sk-live-abcdef1234567890", "[REDACTED]"),
+            ("sk-test-abcdef1234567890", "[REDACTED]"),
+            ("pk_live_1234567890ab", "[REDACTED]"),
+            ("rk_test_1234567890ab", "[REDACTED]"),
+            ("oc_live_12345678", "[REDACTED]"),
+            ("oc_sess_abcd1234_ef", "[REDACTED]"),
+            ("oc_proxy_abcd1234", "[REDACTED]"),
+            ("ghp_12345678901234567890abcd", "[REDACTED]"),
+            ("gho_12345678901234567890abcd", "[REDACTED]"),
+            ("ghu_12345678901234567890abcd", "[REDACTED]"),
+            ("ghs_12345678901234567890abcd", "[REDACTED]"),
+            ("github_pat_12345678901234567890_ab", "[REDACTED]"),
+            ("AKIAIOSFODNN7EXAMPLE", "[REDACTED]"),
+            ("Bearer abcdefghijklmnopqrstuvwxyz123456", "Bearer [REDACTED]"),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA1234\n-----END RSA PRIVATE KEY-----",
+                "[REDACTED]",
+            ),
+        ]
+        for secret, expected in samples:
+            scrubbed = scrub_secrets(f"prefix {secret} suffix")
+            self.assertNotIn(secret, scrubbed)
+            self.assertEqual(scrubbed, f"prefix {expected} suffix")
+
+    def test_scrubbing_in_run_command_write_note_and_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            tk = WorktreeToolkit(wt, agent_id="sec-a", sandbox_mode="off")
+            secret_tok = "sk-proj-verysecret1234567890"
+            bearer_tok = "Bearer my_super_long_bearer_token_1234567890"
+            cmd_res = tk.run_command(
+                f"{sys.executable} -c \"import sys; print('{secret_tok}'); print('{bearer_tok}', file=sys.stderr)\""
+            )
+            self.assertTrue(cmd_res["ok"])
+            self.assertNotIn(secret_tok, cmd_res["stdout"])
+            self.assertIn("[REDACTED]", cmd_res["stdout"])
+            self.assertIn("Bearer [REDACTED]", cmd_res["stderr"])
+
+            note_res = tk.write_note("Key", f"Found {secret_tok}")
+            self.assertTrue(note_res["ok"])
+            note_disk = (wt / ".open_swarm" / "notes" / "sec-a.md").read_text(encoding="utf-8")
+            self.assertNotIn(secret_tok, note_disk)
+            self.assertIn("[REDACTED]", note_disk)
+            tk.close()
+
+            with mock.patch(
+                "agent_loop._openai_chat_turn",
+                side_effect=RuntimeError(f"auth failed with {secret_tok}"),
+            ):
+                loop_res = run_agent_loop(
+                    worktree=wt,
+                    system_prompt="SYS",
+                    user_prompt="Task",
+                    base_url="http://127.0.0.1:1/v1",
+                    api_key="k",
+                    model="m",
+                )
+            self.assertFalse(loop_res["ok"])
+            self.assertNotIn(secret_tok, loop_res["error"])
+            self.assertIn("[REDACTED]", loop_res["error"])
+
+
+class Phase2BSandboxTests(unittest.TestCase):
+    def test_sandbox_off_reports_unsandboxed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tk = WorktreeToolkit(Path(tmp), sandbox_mode="off")
+            res = tk.run_command("echo hello")
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["sandbox"], "unsandboxed")
+            self.assertEqual(res["stdout"].strip(), "hello")
+
+    def test_sandbox_auto_nested_fallback_and_strict_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            with mock.patch("agent_loop.sys.platform", "darwin"), mock.patch(
+                "agent_loop.shutil.which", side_effect=lambda b: "/usr/bin/sandbox-exec" if b == "sandbox-exec" else None
+            ):
+                calls: list[list[str] | str] = []
+
+                def fake_run(cmd, **kwargs):
+                    calls.append(cmd)
+                    if isinstance(cmd, list) and cmd[0] == "sandbox-exec":
+                        return subprocess.CompletedProcess(
+                            cmd, 71, stdout="", stderr="sandbox-exec: sandbox_apply: Operation not permitted\n"
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="fallback-ok\n", stderr="")
+
+                with mock.patch("agent_loop.subprocess.run", side_effect=fake_run):
+                    tk_auto = WorktreeToolkit(wt, sandbox_mode="auto")
+                    r_auto = tk_auto.run_command("echo fallback-ok")
+                    self.assertTrue(r_auto["ok"])
+                    self.assertEqual(r_auto["sandbox"], "unsandboxed-nested-fallback")
+                    self.assertEqual(r_auto["stdout"].strip(), "fallback-ok")
+                    self.assertEqual(len(calls), 2)
+
+                    calls.clear()
+                    tk_strict = WorktreeToolkit(wt, sandbox_mode="strict")
+                    r_strict = tk_strict.run_command("echo fail")
+                    self.assertFalse(r_strict["ok"])
+                    self.assertEqual(r_strict["returncode"], 71)
+                    self.assertEqual(r_strict["sandbox"], "seatbelt")
+                    self.assertEqual(len(calls), 1)
+
+    def test_linux_bwrap_argv_and_nested_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp).resolve()
+            with mock.patch("agent_loop.sys.platform", "linux"), mock.patch(
+                "agent_loop.shutil.which", side_effect=lambda b: "/usr/bin/bwrap" if b == "bwrap" else None
+            ):
+                seen_argv: list[list[str]] = []
+
+                def fake_bwrap(cmd, **kwargs):
+                    if isinstance(cmd, list) and cmd[0] == "bwrap":
+                        seen_argv.append(cmd)
+                        return subprocess.CompletedProcess(cmd, 0, stdout="bwrap-ok\n", stderr="")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="direct\n", stderr="")
+
+                with mock.patch("agent_loop.subprocess.run", side_effect=fake_bwrap):
+                    tk = WorktreeToolkit(wt, sandbox_mode="auto")
+                    r = tk.run_command("pwd")
+                self.assertTrue(r["ok"])
+                self.assertEqual(r["sandbox"], "bwrap")
+                argv = seen_argv[0]
+                self.assertIn("--tmpfs", argv)
+                self.assertIn("--bind", argv)
+                self.assertIn(str(wt), argv)
+
+    def test_macos_real_seatbelt_if_unrestricted(self) -> None:
+        if sys.platform != "darwin" or not shutil.which("sandbox-exec"):
+            self.skipTest("macOS sandbox-exec not present")
+        probe = subprocess.run(
+            ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            self.skipTest("Already inside nested macOS Seatbelt sandbox")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            wt = root / "wt"
+            wt.mkdir()
+            outside = root / "outside.txt"
+            outside.write_text("orig", encoding="utf-8")
+
+            tk = WorktreeToolkit(wt, sandbox_mode="strict")
+            r_in = tk.run_command("echo ok > inside.txt && cat inside.txt")
+            self.assertTrue(r_in["ok"], r_in)
+            self.assertEqual(r_in["sandbox"], "seatbelt")
+            self.assertEqual((wt / "inside.txt").read_text(encoding="utf-8").strip(), "ok")
+
+            r_out = tk.run_command(f"echo pwn > {outside}")
+            self.assertFalse(r_out["ok"])
+            self.assertEqual(outside.read_text(encoding="utf-8"), "orig")
+
+            ssh_dir = Path.home() / ".ssh"
+            if ssh_dir.exists():
+                r_ssh = tk.run_command(f"ls {ssh_dir}")
+                self.assertFalse(r_ssh["ok"])
+
+
+class Phase2BACIUpgradeTests(unittest.TestCase):
+    def test_tools_schema_known_names_and_fallback_instructions(self) -> None:
+        expected = {
+            "read_file",
+            "search_code",
+            "list_dir",
+            "edit_file",
+            "write_file",
+            "run_command",
+            "start_bg_cmd",
+            "poll_bg_cmd",
+            "stop_bg_cmd",
+            "git_diff",
+            "post_board",
+            "read_board",
+            "claim_file",
+            "write_note",
+            "finish",
+        }
+        self.assertEqual(_KNOWN_TOOL_NAMES, expected)
+        self.assertEqual({t["function"]["name"] for t in TOOLS_SCHEMA}, expected)
+        for tool_name in expected:
+            self.assertIn(tool_name, _FALLBACK_TOOL_INSTRUCTIONS)
+
+    def test_list_dir_confinement_and_skip_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wt = root / "wt"
+            wt.mkdir()
+            (wt / ".git").mkdir()
+            (wt / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+            (wt / "__pycache__").mkdir()
+            (wt / "__pycache__" / "m.pyc").write_bytes(b"00")
+            (wt / "src").mkdir()
+            (wt / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+            (wt / "README.md").write_text("hi\n", encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir()
+            (wt / "bad_link").symlink_to(outside)
+
+            tk = WorktreeToolkit(wt)
+            r_root = tk.list_dir()
+            self.assertTrue(r_root["ok"])
+            names = [e["name"] for e in r_root["entries"]]
+            self.assertEqual(names, ["README.md", "src"])
+
+            r_sub = tk.list_dir("src")
+            self.assertTrue(r_sub["ok"])
+            self.assertEqual([e["path"] for e in r_sub["entries"]], ["src/a.py"])
+
+            r_lim = tk.list_dir("", max_entries=1)
+            self.assertTrue(r_lim["ok"])
+            self.assertEqual(len(r_lim["entries"]), 1)
+            self.assertTrue(r_lim["truncated"])
+
+            self.assertFalse(tk.list_dir("..")["ok"])
+            self.assertFalse(tk.list_dir(".git")["ok"])
+            self.assertFalse(tk.list_dir("bad_link")["ok"])
+
+    def test_git_diff_full_and_stat_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            subprocess.run(["git", "init"], cwd=str(wt), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(wt), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(wt), capture_output=True, check=True)
+            (wt / "app.py").write_text("VAL = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(wt), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(wt), capture_output=True, check=True)
+
+            tk = WorktreeToolkit(wt)
+            tk.edit_file("app.py", "VAL = 1", "VAL = 2")
+
+            full = tk.git_diff(stat_only=False)
+            self.assertTrue(full["ok"])
+            self.assertIn("-VAL = 1", full["diff"])
+            self.assertIn("+VAL = 2", full["diff"])
+
+            stat = tk.git_diff(stat_only=True)
+            self.assertTrue(stat["ok"])
+            self.assertTrue(stat["stat_only"])
+            self.assertIn("app.py", stat["diff"])
+
+    def test_edit_file_closest_match_and_inline_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            lines = [f"line_{i} = {i}" for i in range(1, 15)]
+            lines[6] = "def compute(x, y):"
+            lines[7] = "    return x + y"
+            (wt / "mod.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            tk = WorktreeToolkit(wt)
+            miss = tk.edit_file("mod.py", "def compute(x, y):\n  return x + y", "pass")
+            self.assertFalse(miss["ok"])
+            self.assertIn("Closest match", miss["error"])
+            self.assertIn("7: def compute(x, y):", miss["closest_match"])
+            self.assertIn("8:     return x + y", miss["closest_match"])
+
+            # Valid python write -> empty diagnostics and NO __pycache__ left behind
+            ok_py = tk.write_file("clean.py", "def f(a):\n    return a * 2\n")
+            self.assertTrue(ok_py["ok"])
+            self.assertEqual(ok_py["diagnostics"], [])
+            self.assertFalse((wt / "__pycache__").exists())
+
+            # Invalid python edit -> diagnostics populated
+            bad_py = tk.edit_file("clean.py", "return a * 2", "return (a *")
+            self.assertTrue(bad_py["ok"])
+            self.assertTrue(bad_py["diagnostics"])
+
+            # JSON diagnostics
+            ok_json = tk.write_file("cfg.json", '{"a": 1}\n')
+            self.assertTrue(ok_json["ok"])
+            self.assertEqual(ok_json["diagnostics"], [])
+
+            bad_json = tk.write_file("bad.json", '{"a": }\n')
+            self.assertTrue(bad_json["ok"])
+            self.assertTrue(bad_json["diagnostics"])
+            self.assertIn("JSONDecodeError", bad_json["diagnostics"][0])
+
+            # JS diagnostics when node is installed
+            if shutil.which("node"):
+                bad_js = tk.write_file("bad.js", "function broken( { return 1; }\n")
+                self.assertTrue(bad_js["ok"])
+                self.assertTrue(bad_js["diagnostics"])
+
+    def test_board_tools_standalone_continuity_and_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp) / "wt"
+            wt.mkdir()
+            (wt / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+            # Standalone mode
+            tk_sa = WorktreeToolkit(wt, readonly_paths=("locked.txt",))
+            p_sa = tk_sa.post_board("status", "working")
+            self.assertTrue(p_sa["ok"])
+            self.assertTrue(p_sa["standalone"])
+            r_sa = tk_sa.read_board(0)
+            self.assertTrue(r_sa["ok"])
+            self.assertEqual(r_sa["events"], [])
+            c_sa = tk_sa.claim_file("a.py")
+            self.assertTrue(c_sa["ok"])
+            self.assertTrue(c_sa["claimed"])
+            self.assertFalse(tk_sa.claim_file("../escape.py")["ok"])
+            self.assertFalse(tk_sa.claim_file("locked.txt")["ok"])
+
+            # ContinuityStore-backed board
+            store = ContinuityStore(Path(tmp) / "cont.db")
+            tk_a = WorktreeToolkit(wt, agent_id="coder-a", board_store=store, run_id="run-1")
+            tk_b = WorktreeToolkit(wt, agent_id="coder-b", board_store=store, run_id="run-1")
+            tk_a.post_board("finding", "API ready", to_agent="coder-b")
+            tk_a.claim_file("a.py")
+            msgs = tk_b.read_board(since_seq=0)
+            self.assertTrue(msgs["ok"])
+            self.assertGreaterEqual(len(msgs["events"]), 2)
+            self.assertTrue(any("API ready" in e["body"] for e in msgs["events"]))
+
+            # Callback-backed board
+            seen_cb: list[tuple[str, dict]] = []
+            tk_cb = WorktreeToolkit(
+                wt,
+                agent_id="coder-c",
+                run_id="run-cb",
+                board_callback=lambda act, payload: seen_cb.append((act, payload)) or {"ok": True, "ack": act},
+            )
+            self.assertEqual(tk_cb.post_board("status", "hi")["ack"], "post_board")
+            self.assertEqual(tk_cb.read_board(5)["ack"], "read_board")
+            self.assertEqual(tk_cb.claim_file("a.py")["ack"], "claim_file")
+            self.assertEqual([x[0] for x in seen_cb], ["post_board", "read_board", "claim_file"])
+
+    def test_bg_cmd_lifecycle_scrubbing_and_cleanup_on_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            tk = WorktreeToolkit(wt, sandbox_mode="off")
+            start = tk.start_bg_cmd(
+                f"{sys.executable} -u -c \"print('boot sk-proj-secretbg1234567890'); import time; time.sleep(0.05); print('ready')\"",
+                name="worker",
+            )
+            self.assertTrue(start["ok"], start)
+            hid = start["handle_id"]
+            collected = ""
+            for _ in range(30):
+                polled = tk.poll_bg_cmd(hid)
+                self.assertTrue(polled["ok"])
+                collected += polled["output"]
+                if "ready" in collected and not polled["running"]:
+                    break
+                time.sleep(0.05)
+            self.assertIn("boot [REDACTED]", collected)
+            self.assertIn("ready", collected)
+            self.assertNotIn("sk-proj-secretbg1234567890", collected)
+
+            # Long-running process auto-cleaned by close()
+            long_res = tk.start_bg_cmd(f"{sys.executable} -c \"import time; time.sleep(60)\"", name="sleeper")
+            self.assertTrue(long_res["ok"])
+            pid = long_res["pid"]
+            tk.close()
+            time.sleep(0.05)
+            poll_after = tk.poll_bg_cmd(long_res["handle_id"])
+            self.assertFalse(poll_after["running"])
+            with self.assertRaises(OSError):
+                os.kill(pid, 0)
+
+    def test_turn0_env_header_injected_and_system_prompt_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            script = [
+                {
+                    "tool_calls": [
+                        {"id": "f1", "type": "function", "function": {"name": "finish", "arguments": {"summary": "done"}}}
+                    ]
+                }
+            ]
+            with MockOpenAIServer(lambda idx, _body: script[idx]) as srv:
+                res = run_agent_loop(
+                    worktree=wt,
+                    system_prompt="EXACT_SYSTEM_PREFIX",
+                    user_prompt="Do the task.",
+                    base_url=srv.url,
+                    api_key="k",
+                    model="m",
+                    device_name="Mac Studio M3 Ultra",
+                )
+                self.assertTrue(res["ok"])
+                msgs = srv.requests[0]["messages"]
+                self.assertEqual(msgs[0]["content"], "EXACT_SYSTEM_PREFIX")
+                user0 = msgs[1]["content"]
+                header = user0.split("\n\nDo the task.")[0]
+                self.assertEqual(len(header.splitlines()), 3)
+                self.assertIn(sys.platform, header)
+                self.assertIn("Mac Studio M3 Ultra", header)
+
+
+class Phase2BSwarmRunTests(unittest.TestCase):
+    def test_run_swarm_defaults_and_wiring(self) -> None:
+        sig = inspect.signature(run_swarm)
+        self.assertIs(sig.parameters["use_tool_loop"].default, True)
+        self.assertIn("board_store", sig.parameters)
+        self.assertIn("run_id", sig.parameters)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=str(repo), capture_output=True, check=True)
+            (repo / "app.py").write_text("X = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=str(repo), capture_output=True, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo), capture_output=True, check=True)
+
+            store = ContinuityStore(Path(tmp) / "board.db")
+            script = [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "b1",
+                            "type": "function",
+                            "function": {"name": "claim_file", "arguments": {"path": "app.py"}},
+                        },
+                        {
+                            "id": "b2",
+                            "type": "function",
+                            "function": {"name": "edit_file", "arguments": {"path": "app.py", "old_text": "X = 1", "new_text": "X = 99"}},
+                        },
+                        {
+                            "id": "b3",
+                            "type": "function",
+                            "function": {"name": "post_board", "arguments": {"kind": "status", "body": "updated X"}},
+                        },
+                        {
+                            "id": "b4",
+                            "type": "function",
+                            "function": {"name": "finish", "arguments": {"summary": "done"}},
+                        },
+                    ]
+                }
+            ]
+            with MockOpenAIServer(lambda idx, _body: script[idx]) as srv:
+                res = run_swarm(
+                    repo=repo,
+                    tasks=[
+                        {
+                            "title": "Update X",
+                            "spec": "Set X = 99 in app.py",
+                            "acceptance_cmd": f"{sys.executable} -c \"import app; assert app.X == 99\"",
+                        }
+                    ],
+                    base_url=srv.url,
+                    model="mock-model",
+                    board_store=store,
+                    run_id="custom-run-42",
+                )
+            self.assertEqual(res["run_id"], "custom-run-42")
+            self.assertEqual(res["passed_count"], 1)
+            self.assertIn("+X = 99", res["results"][0]["diff"])
+            bmsgs = store.read_board_messages("custom-run-42")
+            leases = store.list_file_leases("custom-run-42")
+            self.assertTrue(any(l["rel_path"] == "app.py" for l in leases))
+            self.assertTrue(any(m["kind"] == "CLAIM_FILE" and "app.py" in m["body"] for m in bmsgs))
+            self.assertTrue(any(m["kind"] == "FINDING" and "updated X" in m["body"] for m in bmsgs))
 
 
 if __name__ == "__main__":

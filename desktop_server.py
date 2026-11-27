@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import inspect
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import subprocess
 import sys
@@ -25,6 +27,8 @@ from typing import Any
 import urllib.error
 from urllib.parse import parse_qs, urlsplit
 import urllib.request
+
+APP_VERSION = "0.4.0"
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -178,11 +182,12 @@ def create_or_sync_self_build_repo(self_build_dir: Path | None = None, *, reset:
         )
 
     if not (target / ".git").exists():
-        subprocess.run(["git", "init"], cwd=str(target), capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.name", "Open Swarm"], cwd=str(target), capture_output=True, check=True)
-        subprocess.run(["git", "config", "user.email", "swarm@outrcore.com"], cwd=str(target), capture_output=True, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=str(target), capture_output=True, check=True)
-        subprocess.run(["git", "commit", "-m", "Initial Open Swarm copy"], cwd=str(target), capture_output=True, check=True)
+        _g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+        subprocess.run([*_g, "init"], cwd=str(target), capture_output=True, check=True)
+        subprocess.run([*_g, "config", "user.name", "Open Swarm"], cwd=str(target), capture_output=True, check=True)
+        subprocess.run([*_g, "config", "user.email", "swarm@outrcore.com"], cwd=str(target), capture_output=True, check=True)
+        subprocess.run([*_g, "add", "-A"], cwd=str(target), capture_output=True, check=True)
+        subprocess.run([*_g, "commit", "-m", "Initial Open Swarm copy"], cwd=str(target), capture_output=True, check=True)
     return str(target)
 
 
@@ -256,11 +261,12 @@ def create_sample_sandbox_repo() -> str:
     (demo_dir / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (demo_dir / "tests" / "__init__.py").write_text("", encoding="utf-8")
     (demo_dir / "README.md").write_text("# Open Swarm Sandbox Repo\n", encoding="utf-8")
-    subprocess.run(["git", "init"], cwd=str(demo_dir), capture_output=True, check=True)
-    subprocess.run(["git", "config", "user.name", "Open Swarm"], cwd=str(demo_dir), capture_output=True, check=True)
-    subprocess.run(["git", "config", "user.email", "swarm@outrcore.com"], cwd=str(demo_dir), capture_output=True, check=True)
-    subprocess.run(["git", "add", "-A"], cwd=str(demo_dir), capture_output=True, check=True)
-    subprocess.run(["git", "commit", "-m", "Initial sandbox"], cwd=str(demo_dir), capture_output=True, check=True)
+    _g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+    subprocess.run([*_g, "init"], cwd=str(demo_dir), capture_output=True, check=True)
+    subprocess.run([*_g, "config", "user.name", "Open Swarm"], cwd=str(demo_dir), capture_output=True, check=True)
+    subprocess.run([*_g, "config", "user.email", "swarm@outrcore.com"], cwd=str(demo_dir), capture_output=True, check=True)
+    subprocess.run([*_g, "add", "-A"], cwd=str(demo_dir), capture_output=True, check=True)
+    subprocess.run([*_g, "commit", "-m", "Initial sandbox"], cwd=str(demo_dir), capture_output=True, check=True)
     return str(demo_dir)
 
 
@@ -368,9 +374,71 @@ class DesktopAppState:
         self.devices = DeviceRegistry(self.runs_dir.parent / "devices.json")
         self.preview = PreviewServerManager(port=preview_port, default_repo=self.self_build_dir)
         self.runner_fn = runner_fn or run_swarm
+        self.csrf_token: str = secrets.token_hex(24)
         self._lock = threading.Lock()
         self._runs: dict[str, dict[str, Any]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._proxy_tokens: dict[str, dict[str, Any]] = {}
+        self._listen_port: int | None = None
         self._load_saved_runs()
+
+    def issue_proxy_token(
+        self,
+        *,
+        run_id: str,
+        base_url: str,
+        api_key: str,
+        ttl_s: float = 3600.0,
+    ) -> str:
+        tok = f"oc_proxy_{secrets.token_hex(20)}"
+        with self._lock:
+            self._proxy_tokens[tok] = {
+                "run_id": run_id,
+                "base_url": str(base_url).strip(),
+                "api_key": str(api_key or "outrcore-swarm").strip(),
+                "expires_at": time.time() + max(30.0, float(ttl_s)),
+            }
+        return tok
+
+    def resolve_proxy_token(self, auth_header: str) -> dict[str, Any] | None:
+        raw = str(auth_header or "").strip()
+        if raw.lower().startswith("bearer "):
+            raw = raw[7:].strip()
+        if not raw:
+            return None
+        now = time.time()
+        with self._lock:
+            for tok, meta in list(self._proxy_tokens.items()):
+                if float(meta.get("expires_at") or 0.0) <= now:
+                    self._proxy_tokens.pop(tok, None)
+                    continue
+                if hmac.compare_digest(tok, raw):
+                    return dict(meta)
+        return None
+
+    def revoke_run_proxy_tokens(self, run_id: str) -> None:
+        with self._lock:
+            for tok, meta in list(self._proxy_tokens.items()):
+                if meta.get("run_id") == run_id:
+                    self._proxy_tokens.pop(tok, None)
+
+    def cancel_run(self, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            rec = self._runs.get(run_id)
+            if rec is None:
+                raise KeyError(f"Unknown run {run_id}")
+            ev = self._cancel_events.get(run_id)
+            if ev is not None:
+                ev.set()
+            if rec.get("status") == "running":
+                rec["status"] = "cancelled"
+                rec["finished_at"] = time.time()
+                rec.setdefault("events", []).append(
+                    {"ts": rec["finished_at"], "kind": "run_cancelled", "msg": "Run cancelled by user"}
+                )
+        self.revoke_run_proxy_tokens(run_id)
+        self._save_run(rec)
+        return {"ok": True, "run_id": run_id, "status": rec.get("status")}
 
     def _load_saved_runs(self) -> None:
         for p in sorted(self.runs_dir.glob("*.json"))[-30:]:
@@ -437,7 +505,7 @@ class DesktopAppState:
         auto_review: bool = True,
         judge_model: str | None = None,
         judge_base_url: str | None = None,
-        use_tool_loop: bool = False,
+        use_tool_loop: bool = True,
         research_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         repo = Path(repo_path).expanduser().resolve()
@@ -567,6 +635,18 @@ class DesktopAppState:
             "error": None,
         }
         self._save_run(initial)
+        cancel_ev = threading.Event()
+        with self._lock:
+            self._cancel_events[run_id] = cancel_ev
+        proxy_tok = ""
+        proxy_url = ""
+        if self._listen_port:
+            proxy_tok = self.issue_proxy_token(
+                run_id=run_id,
+                base_url=backend_url,
+                api_key=api_key or "outrcore-swarm",
+            )
+            proxy_url = f"http://127.0.0.1:{self._listen_port}/api/llm/proxy/v1"
         last_persist = [time.monotonic()]
 
         def _on_progress(ev: dict[str, Any]) -> None:
@@ -760,8 +840,13 @@ class DesktopAppState:
                             "auto_review": bool(auto_review),
                             "use_tool_loop": bool(use_tool_loop),
                             "continuity_store": self.continuity,
+                            "board_store": self.continuity,
+                            "run_id": run_id,
                             "runs_dir": self.runs_dir,
                             "device_registry": self.devices,
+                            "cancel_event": cancel_ev,
+                            "llm_proxy_url": proxy_url,
+                            "llm_proxy_token": proxy_tok,
                         }
                         for k, v in extras.items():
                             if has_varkw or k in sig.parameters:
@@ -773,12 +858,13 @@ class DesktopAppState:
                     cur_prewarm = cur.get("prewarm_status", "done")
                     cur_live = dict(cur.get("agents_live") or {})
                     cur_tasks = list(cur.get("tasks") or resolved_tasks)
+                    was_cancelled = cancel_ev.is_set() or cur.get("status") == "cancelled" or bool(rec.get("cancelled"))
                 merged = dict(initial)
                 merged.update(rec)
                 merged["run_id"] = run_id
                 merged["mode"] = run_mode
                 merged["tasks"] = cur_tasks
-                merged["status"] = "completed"
+                merged["status"] = "cancelled" if was_cancelled else "completed"
                 merged["finished_at"] = time.time()
                 merged["prewarm_status"] = cur_prewarm
                 if "collisions" not in merged:
@@ -845,6 +931,10 @@ class DesktopAppState:
                     )
                 except Exception:
                     pass
+            finally:
+                self.revoke_run_proxy_tokens(run_id)
+                with self._lock:
+                    self._cancel_events.pop(run_id, None)
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
@@ -876,9 +966,10 @@ class DesktopAppState:
         with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False, encoding="utf-8") as tf:
             tf.write(diff_txt)
             patch_path = tf.name
+        _g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
         try:
             chk = subprocess.run(
-                ["git", "apply", "--check", patch_path],
+                [*_g, "apply", "--check", patch_path],
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
@@ -886,7 +977,7 @@ class DesktopAppState:
             if chk.returncode != 0:
                 raise RuntimeError(f"git apply --check failed: {(chk.stderr or chk.stdout).strip()}")
             ap = subprocess.run(
-                ["git", "apply", patch_path],
+                [*_g, "apply", patch_path],
                 cwd=str(repo),
                 capture_output=True,
                 text=True,
@@ -952,6 +1043,8 @@ class DesktopAppState:
             (t for t in tasks_list if t.get("agent_id") == agent_id or t.get("title") == target.get("title")),
             tasks_list[0] if tasks_list else {},
         )
+        wt_raw = str(target.get("worktree") or "").strip()
+        wt_path = Path(wt_raw) if wt_raw and Path(wt_raw).is_dir() else None
         verdict = review_agent_diff(
             ticket_title=str(target.get("title") or matching_task.get("title") or target.get("ticket") or agent_id),
             ticket_spec=str(matching_task.get("spec") or ""),
@@ -962,6 +1055,7 @@ class DesktopAppState:
             reviewer_model=reviewer_model or str(rec.get("model") or ""),
             api_key=api_key or "outrcore-swarm",
             allow_same_vendor_fresh=allow_same_vendor_fresh,
+            worktree=wt_path,
         )
         target["review"] = verdict
         self._save_run(rec)
@@ -978,17 +1072,91 @@ class DesktopAppState:
             pass
         return verdict
 
-    def apply_all_passed(self, run_id: str, *, force: bool = False) -> dict[str, Any]:
+    def _run_integration_merge_gate(
+        self,
+        repo: Path,
+        diffs: list[str],
+        verify_cmds: list[str],
+    ) -> dict[str, Any]:
+        """Stage all winning diffs inside a throwaway worktree and verify combined tests before touching main."""
+        clean_cmds = [str(c).strip() for c in verify_cmds if str(c).strip()]
+        if not diffs or not clean_cmds:
+            return {"ok": True, "skipped": True, "output": ""}
+        gate_dir = Path(tempfile.mkdtemp(prefix="open_swarm_gate_"))
+        _g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+        try:
+            wt_add = subprocess.run(
+                [*_g, "worktree", "add", "--detach", str(gate_dir), "HEAD"],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+            )
+            if wt_add.returncode != 0:
+                return {"ok": False, "output": f"staging worktree create failed: {(wt_add.stderr or wt_add.stdout).strip()}"}
+            for idx, dtxt in enumerate(diffs):
+                with tempfile.NamedTemporaryFile("w", suffix=f"_{idx}.patch", delete=False, encoding="utf-8") as tf:
+                    tf.write(dtxt)
+                    ppath = tf.name
+                try:
+                    ap = subprocess.run([*_g, "apply", ppath], cwd=str(gate_dir), capture_output=True, text=True)
+                    if ap.returncode != 0:
+                        return {
+                            "ok": False,
+                            "output": f"combined patch {idx + 1} failed to apply in staging worktree: {(ap.stderr or ap.stdout).strip()}",
+                        }
+                finally:
+                    try:
+                        os.unlink(ppath)
+                    except OSError:
+                        pass
+            gate_env = dict(os.environ)
+            gate_env["PYTHONDONTWRITEBYTECODE"] = "1"
+            outputs: list[str] = []
+            for cmd in clean_cmds:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(gate_dir),
+                    shell=True,
+                    env=gate_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                if combined:
+                    outputs.append(f"$ {cmd}\n{combined[-1200:]}")
+                if proc.returncode != 0:
+                    return {
+                        "ok": False,
+                        "failed_cmd": cmd,
+                        "returncode": proc.returncode,
+                        "output": "\n".join(outputs)[-2400:],
+                    }
+            return {"ok": True, "cmds": clean_cmds, "output": "\n".join(outputs)[-1200:]}
+        finally:
+            subprocess.run([*_g, "worktree", "remove", "--force", str(gate_dir)], cwd=str(repo), capture_output=True, check=False)
+            shutil.rmtree(gate_dir, ignore_errors=True)
+            subprocess.run([*_g, "worktree", "prune"], cwd=str(repo), capture_output=True, check=False)
+
+    def apply_all_passed(
+        self,
+        run_id: str,
+        *,
+        force: bool = False,
+        verify_cmd: str | None = None,
+    ) -> dict[str, Any]:
         rec = self.get_run(run_id)
         if not rec:
             raise KeyError(f"Unknown run {run_id}")
+        repo = Path(rec["repo"])
         results = rec.get("results") or []
         collisions = detect_file_collisions(results)
         colliding_agents: set[str] = set()
         for aids in collisions.values():
             colliding_agents.update(aids)
         already = set(rec.get("applied_agents") or [])
-        applied: list[str] = []
+
+        candidates: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
         for r in results:
             aid = str(r.get("agent_id") or "")
@@ -1000,30 +1168,64 @@ class DesktopAppState:
             if aid in colliding_agents and not force:
                 skipped.append({"agent_id": aid, "reason": "file write collision detected"})
                 continue
+            candidates.append(r)
+
+        gate_result: dict[str, Any] = {"ok": True, "skipped": True}
+        if candidates and not force:
+            verify_cmds: list[str] = []
+            if verify_cmd and str(verify_cmd).strip():
+                verify_cmds = [str(verify_cmd).strip()]
+            else:
+                seen_cmds: set[str] = set()
+                for t in rec.get("tasks") or []:
+                    ac = str(t.get("acceptance_cmd") or "").strip()
+                    if ac and ac not in seen_cmds:
+                        seen_cmds.add(ac)
+                        verify_cmds.append(ac)
+            if verify_cmds:
+                gate_result = self._run_integration_merge_gate(
+                    repo,
+                    [str(c.get("diff") or "") for c in candidates],
+                    verify_cmds,
+                )
+                if not gate_result.get("ok"):
+                    raise RuntimeError(f"Post-merge integration gate failed: {gate_result.get('output') or 'verification failed'}")
+
+        applied: list[str] = []
+        for r in candidates:
+            aid = str(r.get("agent_id") or "")
             try:
                 self.apply_agent_diff(run_id, aid, force=force)
                 applied.append(aid)
             except Exception as exc:
                 skipped.append({"agent_id": aid, "reason": str(exc)})
-        return {"ok": True, "run_id": run_id, "applied": applied, "skipped": skipped, "collisions": collisions}
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "applied": applied,
+            "skipped": skipped,
+            "collisions": collisions,
+            "integration_gate": gate_result,
+        }
 
     def cleanup_worktrees(self, run_id: str) -> dict[str, Any]:
         rec = self.get_run(run_id)
         if not rec:
             raise KeyError(f"Unknown run {run_id}")
         repo = Path(rec["repo"])
+        _g = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
         removed: list[str] = []
         for r in rec.get("results", []):
             wt = Path(str(r.get("worktree") or ""))
             if wt.exists():
                 subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(wt)],
+                    [*_g, "worktree", "remove", "--force", str(wt)],
                     cwd=str(repo),
                     capture_output=True,
                     check=False,
                 )
                 removed.append(str(wt))
-        subprocess.run(["git", "worktree", "prune"], cwd=str(repo), capture_output=True, check=False)
+        subprocess.run([*_g, "worktree", "prune"], cwd=str(repo), capture_output=True, check=False)
         rec["worktrees_cleaned"] = True
         self._save_run(rec)
         return {"ok": True, "removed": removed}
@@ -1060,13 +1262,47 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
             raw = self.rfile.read(n) if n > 0 else b"{}"
             return json.loads(raw.decode("utf-8") or "{}")
 
+        def _validate_host(self) -> bool:
+            raw_host = str(self.headers.get("Host") or "").strip()
+            if not raw_host:
+                return True
+            parsed = urlsplit(f"http://{raw_host}")
+            hostname = (parsed.hostname or "").strip().lower()
+            return hostname in ("127.0.0.1", "localhost", "::1")
+
+        def _validate_origin_and_csrf(self, path: str) -> bool:
+            if not self._validate_host():
+                self._send_json(403, {"error": "Forbidden Host header"})
+                return False
+            if path.startswith("/api/llm/proxy/"):
+                return True
+            origin = str(self.headers.get("Origin") or "").strip()
+            if origin:
+                op = urlsplit(origin)
+                ohost = (op.hostname or "").strip().lower()
+                if op.scheme not in ("http", "https") or ohost not in ("127.0.0.1", "localhost", "::1"):
+                    self._send_json(403, {"error": "Forbidden Origin header"})
+                    return False
+                req_csrf = str(self.headers.get("X-OpenSwarm-CSRF") or "").strip()
+                if not req_csrf or not hmac.compare_digest(req_csrf, state.csrf_token):
+                    self._send_json(403, {"error": "Invalid or missing X-OpenSwarm-CSRF token"})
+                    return False
+            return True
+
         def do_GET(self) -> None:  # noqa: N802
+            if not self._validate_host():
+                self._send_json(403, {"error": "Forbidden Host header"})
+                return
             path = self.path.split("?", 1)[0]
             if path == "/" or path == "/index.html":
                 if not ui_file.is_file():
                     self._send_json(404, {"error": "desktop_ui.html missing"})
                     return
-                body = ui_file.read_bytes()
+                html_txt = ui_file.read_text(encoding="utf-8")
+                csrf_meta = f'<meta name="open-swarm-csrf" content="{state.csrf_token}" />'
+                if "</head>" in html_txt and "open-swarm-csrf" not in html_txt:
+                    html_txt = html_txt.replace("</head>", f"{csrf_meta}\n</head>", 1)
+                body = html_txt.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -1074,12 +1310,14 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                 self.wfile.write(body)
                 return
             if path == "/health":
-                self._send_json(200, {"status": "ok", "app": "open-swarm-desktop"})
+                self._send_json(200, {"status": "ok", "app": "open-swarm-desktop", "version": APP_VERSION})
                 return
             if path == "/api/config":
                 self._send_json(
                     200,
                     {
+                        "version": APP_VERSION,
+                        "csrf_token": state.csrf_token,
                         "presets": load_presets(),
                         "lanes": LANES,
                         "default_repo": _default_repo_path(),
@@ -1160,6 +1398,58 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                 except Exception as exc:
                     self._send_json(500, {"error": str(exc)})
                 return
+            if path == "/api/board/messages":
+                qs = parse_qs(urlsplit(self.path).query)
+                run_id = str((qs.get("run_id") or [""])[0]).strip()
+                if not run_id:
+                    self._send_json(400, {"error": "run_id is required"})
+                    return
+                since_seq = int((qs.get("since_seq") or ["0"])[0] or 0)
+                to_agent = (qs.get("to_agent") or [None])[0]
+                kind = (qs.get("kind") or [None])[0]
+                msgs = state.continuity.read_board_messages(
+                    run_id,
+                    since_seq=since_seq,
+                    to_agent=to_agent,
+                    kind=kind,
+                )
+                leases = state.continuity.list_file_leases(run_id)
+                self._send_json(200, {"run_id": run_id, "messages": msgs, "leases": leases})
+                return
+            if path == "/api/board/stream":
+                qs = parse_qs(urlsplit(self.path).query)
+                run_id = str((qs.get("run_id") or [""])[0]).strip()
+                if not run_id:
+                    self._send_json(400, {"error": "run_id is required"})
+                    return
+                since_seq = int((qs.get("since_seq") or ["0"])[0] or 0)
+                once = str((qs.get("once") or [""])[0]).strip() in ("1", "true", "yes")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                cursor = since_seq
+                deadline = time.monotonic() + (0.2 if once else 30.0)
+                try:
+                    while True:
+                        msgs = state.continuity.read_board_messages(run_id, since_seq=cursor)
+                        for m in msgs:
+                            cursor = max(cursor, int(m["seq"]))
+                            self.wfile.write(f"event: message\ndata: {json.dumps(m)}\n\n".encode("utf-8"))
+                        leases = state.continuity.list_file_leases(run_id)
+                        self.wfile.write(
+                            f"event: leases\ndata: {json.dumps({'run_id': run_id, 'leases': leases, 'last_seq': cursor})}\n\n".encode("utf-8")
+                        )
+                        self.wfile.flush()
+                        if once or time.monotonic() >= deadline:
+                            self.wfile.write(f"event: done\ndata: {json.dumps({'last_seq': cursor})}\n\n".encode("utf-8"))
+                            self.wfile.flush()
+                            break
+                        time.sleep(0.5)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                return
             if path == "/api/runs":
                 self._send_json(200, {"runs": state.list_runs()})
                 return
@@ -1175,6 +1465,63 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
 
         def do_POST(self) -> None:  # noqa: N802
             path = self.path.split("?", 1)[0]
+            if not self._validate_origin_and_csrf(path):
+                return
+            if path == "/api/llm/proxy/v1/chat/completions":
+                meta = state.resolve_proxy_token(str(self.headers.get("Authorization") or ""))
+                if meta is None:
+                    self._send_json(401, {"error": "Invalid or expired Open Swarm proxy token"})
+                    return
+                try:
+                    body_bytes = self.rfile.read(int(self.headers.get("Content-Length", "0") or "0"))
+                    req_obj = json.loads(body_bytes.decode("utf-8") or "{}")
+                except Exception as exc:
+                    self._send_json(400, {"error": f"invalid JSON: {exc}"})
+                    return
+                target_root_url = meta["base_url"].rstrip("/")
+                up_url = target_root_url if target_root_url.endswith("/chat/completions") else (
+                    target_root_url + "/chat/completions"
+                    if target_root_url.endswith("/v1")
+                    else target_root_url + "/v1/chat/completions"
+                )
+                up_req = urllib.request.Request(
+                    up_url,
+                    data=body_bytes,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {meta['api_key']}",
+                        "User-Agent": f"OutrCore-OpenSwarm/{APP_VERSION}",
+                    },
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(up_req, timeout=300.0) as resp:
+                        ctype = resp.headers.get("Content-Type") or "application/json"
+                        self.send_response(int(resp.status))
+                        self.send_header("Content-Type", ctype)
+                        if bool(req_obj.get("stream", False)):
+                            self.send_header("Cache-Control", "no-cache")
+                            self.end_headers()
+                            for line in resp:
+                                self.wfile.write(line)
+                                self.wfile.flush()
+                        else:
+                            payload_bytes = resp.read()
+                            self.send_header("Content-Length", str(len(payload_bytes)))
+                            self.end_headers()
+                            self.wfile.write(payload_bytes)
+                except urllib.error.HTTPError as exc:
+                    err_b = exc.read()
+                    self.send_response(int(exc.code))
+                    self.send_header("Content-Type", exc.headers.get("Content-Type") or "application/json")
+                    self.send_header("Content-Length", str(len(err_b)))
+                    self.end_headers()
+                    self.wfile.write(err_b)
+                except Exception as exc:
+                    from agent_loop import scrub_secrets
+
+                    self._send_json(502, {"error": scrub_secrets(str(exc))})
+                return
             try:
                 body = self._read_json()
             except Exception as exc:
@@ -1478,7 +1825,7 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                         auto_review=bool(body.get("auto_review", True)),
                         judge_model=(str(body["judge_model"]).strip() if body.get("judge_model") else None),
                         judge_base_url=(str(body["judge_base_url"]).strip() if body.get("judge_base_url") else None),
-                        use_tool_loop=bool(body.get("use_tool_loop", False)),
+                        use_tool_loop=bool(body.get("use_tool_loop", True)),
                         research_config=rc_payload or None,
                     )
                     self._send_json(202, rec)
@@ -1524,10 +1871,76 @@ def make_handler(state: DesktopAppState, html_path: Path | None = None):
                     self._send_json(400, {"error": str(exc)})
                 return
 
+            if path == "/api/board/post":
+                try:
+                    msg = state.continuity.post_board_message(
+                        run_id=str(body.get("run_id") or "").strip(),
+                        from_agent=str(body.get("from_agent") or "human").strip(),
+                        kind=str(body.get("kind") or "FINDING").strip(),
+                        body=str(body.get("body") or ""),
+                        to_agent=str(body.get("to_agent") or "all").strip(),
+                        meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
+                    )
+                    self._send_json(200, msg)
+                except Exception as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/board/claim":
+                try:
+                    out = state.continuity.claim_file_lease(
+                        run_id=str(body.get("run_id") or "").strip(),
+                        rel_path=str(body.get("rel_path") or "").strip(),
+                        owner_agent=str(body.get("owner_agent") or "").strip(),
+                        ttl_s=float(body.get("ttl_s") or 600.0),
+                    )
+                    self._send_json(200 if out.get("claimed") else 409, out)
+                except Exception as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/board/release":
+                try:
+                    released = state.continuity.release_file_lease(
+                        run_id=str(body.get("run_id") or "").strip(),
+                        rel_path=str(body.get("rel_path") or "").strip(),
+                        owner_agent=(str(body["owner_agent"]).strip() if body.get("owner_agent") else None),
+                    )
+                    self._send_json(200, {"ok": True, "released": released})
+                except Exception as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path == "/api/board/resolve":
+                try:
+                    out = state.continuity.resolve_board_decision(
+                        seq=int(body["seq"]),
+                        resolution=str(body.get("resolution") or "").strip(),
+                        resolver=str(body.get("resolver") or "human").strip(),
+                    )
+                    self._send_json(200, out)
+                except KeyError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                except Exception as exc:
+                    self._send_json(400, {"error": str(exc)})
+                return
+
+            if path.startswith("/api/runs/") and path.endswith("/cancel"):
+                run_id = path[len("/api/runs/") : -len("/cancel")].strip("/")
+                try:
+                    self._send_json(200, state.cancel_run(run_id))
+                except KeyError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                return
+
             if path.startswith("/api/runs/") and path.endswith("/apply-all"):
                 run_id = path[len("/api/runs/") : -len("/apply-all")].strip("/")
                 try:
-                    out = state.apply_all_passed(run_id, force=bool(body.get("force", False)))
+                    out = state.apply_all_passed(
+                        run_id,
+                        force=bool(body.get("force", False)),
+                        verify_cmd=(str(body["verify_cmd"]).strip() if body.get("verify_cmd") else None),
+                    )
                     self._send_json(200, out)
                 except KeyError as exc:
                     self._send_json(404, {"error": str(exc)})
@@ -1597,6 +2010,7 @@ def start_server(
         raise ValueError(f"Open Swarm Desktop only binds loopback, got {host!r}")
     app_state = state or DesktopAppState()
     srv = ThreadingHTTPServer((host, port), make_handler(app_state))
+    app_state._listen_port = int(srv.server_address[1])
     return srv
 
 
