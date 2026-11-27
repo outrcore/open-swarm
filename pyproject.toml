@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "outrcore-open-swarm"
-version = "0.5.0"
+version = "0.5.1"
 description = "Apple-clean agent-first parallel coding swarm with git worktree isolation, Swarm Message Board, OS sandboxing, Tailscale compute mesh, CLI doctor/bench, and continuity context guards."
 readme = "README.md"
 requires-python = ">=3.10"

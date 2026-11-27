@@ -396,13 +396,24 @@ def _normalize_ticket(item: Any, fallback_goal: str, index: int) -> dict[str, An
             if s:
                 owned_files.append(s)
 
-    return {
+    out_ticket: dict[str, Any] = {
         "title": title,
         "spec": spec,
         "acceptance_cmd": acceptance_cmd,
         "lane": lane,
         "owned_files": owned_files,
     }
+    if item.get("id"):
+        out_ticket["id"] = str(item["id"]).strip()
+    if item.get("phase"):
+        raw_phase = str(item["phase"]).strip().lower()
+        if raw_phase in ("contract", "impl", "verify"):
+            out_ticket["phase"] = raw_phase
+    if isinstance(item.get("depends_on"), list):
+        deps = [str(d).strip() for d in item["depends_on"] if str(d).strip()]
+        if deps:
+            out_ticket["depends_on"] = deps
+    return out_ticket
 
 
 def decompose_goal_to_tasks(
@@ -431,13 +442,17 @@ def decompose_goal_to_tasks(
             "You are a principal software architect decomposing an engineering goal into "
             f"1 to {limit} non-overlapping parallel git-worktree tickets.\n"
             "Assign disjoint `owned_files` per ticket whenever possible to prevent merge collisions.\n"
+            "When one module defines shared contracts or APIs used by others, give it an `id`, set `\"phase\": \"contract\"`, "
+            "and list its `id` in downstream tickets' `depends_on`.\n"
             "For Python repositories, always write stdlib unittest.TestCase tests and use "
             "'python3 -m unittest <test_file_or_discover>' as acceptance_cmd — never assume pytest or bare 'python' is installed.\n"
             "Respond ONLY with a valid JSON array matching this exact schema:\n"
-            '[{"title": "<short title>", "spec": "<clear implementation spec with tests>", '
+            '[{"id": "T1", "title": "<short title>", "spec": "<clear implementation spec with tests>", '
             '"acceptance_cmd": "<shell test command>", '
             '"lane": "coder" | "mechanical" | "deep-reason", '
-            '"owned_files": ["relative/path.py"]}]'
+            '"owned_files": ["relative/path.py"], '
+            '"phase": "contract" | "impl", '
+            '"depends_on": []}]'
         )
         user_prompt = (
             f"## Goal\n{(goal or '').strip() or 'Implement requested changes.'}\n\n"

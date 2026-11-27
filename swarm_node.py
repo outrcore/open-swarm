@@ -42,7 +42,7 @@ SWARM_DIR = Path(__file__).resolve().parent
 if str(SWARM_DIR) not in sys.path:
     sys.path.insert(0, str(SWARM_DIR))
 
-NODE_VERSION = "0.5.0"
+NODE_VERSION = "0.5.1"
 DEFAULT_PORT = 18799
 MAX_BUNDLE_BYTES = 32 * 1024 * 1024  # 32 MiB
 MAX_PAIR_ATTEMPTS = 5

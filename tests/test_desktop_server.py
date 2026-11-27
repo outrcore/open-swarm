@@ -821,7 +821,7 @@ class DesktopServerTests(unittest.TestCase):
         self.assertIn('name="open-swarm-csrf"', html)
         st_cfg, cfg = _http_json(f"{self.base}/api/config")
         self.assertEqual(st_cfg, 200)
-        self.assertEqual(cfg["version"], "0.5.0")
+        self.assertEqual(cfg["version"], "0.5.1")
         csrf_tok = cfg["csrf_token"]
 
         # 2) Bad Host, bad Origin, and browser Origin without X-OpenSwarm-CSRF are blocked (403)
@@ -992,7 +992,7 @@ class DesktopServerTests(unittest.TestCase):
         self.state._save_run(rec_secret)
         st_exp, exp = _http_json(f"{self.base}/api/runs/gate-run-1/export")
         self.assertEqual(st_exp, 200)
-        self.assertEqual(exp["version"], "0.5.0")
+        self.assertEqual(exp["version"], "0.5.1")
         self.assertEqual(exp["summary_metrics"]["total_turns"], 4)
         self.assertEqual(exp["summary_metrics"]["total_tool_calls"], 9)
         self.assertEqual(exp["summary_metrics"]["tool_histogram"]["run_command"], 4)

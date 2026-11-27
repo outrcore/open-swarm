@@ -293,6 +293,42 @@ class DecomposeGoalToTasksTests(unittest.TestCase):
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0]["lane"], "deep-reason")
 
+            def dag_chat(**_kwargs):
+                return {
+                    "content": json.dumps(
+                        [
+                            {
+                                "id": "C1",
+                                "title": "Define interface",
+                                "spec": "Write interface",
+                                "phase": "contract",
+                                "owned_files": ["api.py"],
+                            },
+                            {
+                                "id": "I1",
+                                "title": "Implement handler",
+                                "spec": "Use api.py",
+                                "phase": "impl",
+                                "depends_on": ["C1"],
+                                "owned_files": ["handler.py"],
+                            },
+                        ]
+                    )
+                }
+
+            dag_tasks = decompose_goal_to_tasks(
+                repo=repo,
+                goal="Build handler with contract",
+                base_url="http://localhost:8000/v1",
+                model="test-model",
+                max_agents=3,
+                chat_fn=dag_chat,
+            )
+            self.assertEqual(len(dag_tasks), 2)
+            self.assertEqual(dag_tasks[0]["id"], "C1")
+            self.assertEqual(dag_tasks[0]["phase"], "contract")
+            self.assertEqual(dag_tasks[1]["depends_on"], ["C1"])
+
             def bad_json_chat(**_kwargs):
                 return {"content": "Not valid JSON at all {oops"}
 

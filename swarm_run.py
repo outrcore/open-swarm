@@ -37,6 +37,7 @@ def build_shared_repo_prefix(
     max_files: int = 60,
     max_total_chars: int = 6000,
     context_brief: str = "",
+    max_file_bytes: int = 3072,
 ) -> str:
     """Deterministic repository context shared byte-for-byte across all parallel workers for prefix caching."""
     from agent_tools import index_repo_symbols
@@ -56,7 +57,7 @@ def build_shared_repo_prefix(
     total_chars = 0
     for rel in prioritized:
         fp = repo / rel
-        if fp.stat().st_size > 3072:
+        if fp.stat().st_size > max_file_bytes:
             continue
         txt = fp.read_text(encoding="utf-8", errors="replace")
         block = f"### FILE: {rel}\n```\n{txt}\n```"

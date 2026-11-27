@@ -30,7 +30,7 @@ SWARM_DIR = Path(__file__).resolve().parent
 if str(SWARM_DIR) not in sys.path:
     sys.path.insert(0, str(SWARM_DIR))
 
-CLI_VERSION = "0.5.0"
+CLI_VERSION = "0.5.1"
 
 
 def _default_state_dir() -> Path:

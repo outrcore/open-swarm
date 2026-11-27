@@ -28,7 +28,7 @@ import urllib.error
 from urllib.parse import parse_qs, urlsplit
 import urllib.request
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:

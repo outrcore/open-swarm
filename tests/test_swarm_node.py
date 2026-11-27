@@ -490,7 +490,7 @@ class TestSwarmNodePhase2D(unittest.TestCase):
                 headers={"Authorization": f"Bearer {token}"},
             )
             self.assertEqual(st, 200)
-            self.assertEqual(health["version"], "0.5.0")
+            self.assertEqual(health["version"], "0.5.1")
             self.assertIsInstance(health["capabilities"], list)
             self.assertIn("telemetry", health)
             self.assertIsInstance(health["mem_avail_gb"], float)
